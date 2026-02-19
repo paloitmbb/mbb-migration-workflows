@@ -149,12 +149,12 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Validate source repository exists on GitHub.com
+      - name: Validate source repository exists 
         run: |
           SRC_ORG="${{ steps.parse.outputs.issueparser_source_organization }}"
           SRC_REPO="${{ steps.parse.outputs.issueparser_source_repo }}"
 
-          echo "Checking source: ${SRC_ORG}/${SRC_REPO} on GitHub.com"
+          echo "Checking source: ${SRC_ORG}/${SRC_REPO} on GitHub"
 
           HTTP_CODE=$(curl -s -o /tmp/src_repo.json -w "%{http_code}" \
             -H "Authorization: Bearer ${{ secrets.GH_SOURCE_PAT }}" \
@@ -165,7 +165,7 @@ jobs:
             gh issue comment ${{ github.event.issue.number }} \
               --body "❌ **Source Validation Failed**
 
-          Repository \`${SRC_ORG}/${SRC_REPO}\` not found on GitHub.com (HTTP ${HTTP_CODE}).
+          Repository \`${SRC_ORG}/${SRC_REPO}\` not found on GitHub (HTTP ${HTTP_CODE}).
 
           Verify:
           - Repository name is correct
@@ -265,7 +265,7 @@ jobs:
 
             const allValid = sourceOrg && sourceRepo && targetOrg && targetRepo;
 
-            let commentBody = '## 🔍 GitHub.com → GitHub.com Migration Request Validation\n\n';
+            let commentBody = '## 🔍 Github Migration Validation Request\n\n';
 
             if (allValid) {
               commentBody += '✅ **All validations passed!**\n\n';
@@ -397,7 +397,7 @@ jobs:
 
             const allValid = sourceOrg && sourceRepo && targetOrg && targetRepo;
 
-            let summary = '# 🔍 GitHub.com → GitHub.com Migration Request Validation\n\n';
+            let summary = '# 🔍 Github Migration Validation Request\n\n';
 
             if (allValid) {
               summary += '## ✅ All validations passed!\n\n';
@@ -472,531 +472,88 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  # Migration:
-  #   name: Migration Configuration
-  #   runs-on: ubuntu-latest
-  #   needs: validate
-  #   permissions:
-  #     contents: write
-  #     issues: write
-  #     pull-requests: write
-  #   environment:
-  #     name: "migration-approval" # Requires approval from paloitmbb-devsecops
-
-  #   steps:
-  #     - name: Checkout repository
-  #       uses: actions/checkout@v4
-  #       with:
-  #         token: ${{ secrets.GITHUB_TOKEN }}
-
-  #     - name: Configure Git
-  #       run: |
-  #         git config user.name "github-actions[bot]"
-  #         git config user.email "github-actions[bot]@users.noreply.github.com"
-
-  #     - name: Update ghec-migration.yaml
-  #       id: update-migration
-  #       run: |
-  #         # Install yq if not available
-  #         if ! command -v yq &> /dev/null; then
-  #           sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
-  #           sudo chmod +x /usr/local/bin/yq
-  #         fi
-
-  #         SOURCE_ORG="${{ needs.validate.outputs.source_organization }}"
-  #         SOURCE_REPO="${{ needs.validate.outputs.source_repo }}"
-  #         TARGET_ORG="${{ needs.validate.outputs.target_organization }}"
-  #         TARGET_REPO="${{ needs.validate.outputs.target_repo }}"
-  #         TARGET_VISIBILITY="${{ needs.validate.outputs.target_visibility }}"
-  #         ADMINS="${{ needs.validate.outputs.admins }}"
-  #         MIGRATION_OPTIONS="${{ needs.validate.outputs.migration_options }}"
-  #         TEAM_MAPPINGS="${{ needs.validate.outputs.team_mappings }}"
-  #         JUSTIFICATION="${{ needs.validate.outputs.justification }}"
-  #         ISSUE_NUMBER="${{ github.event.issue.number }}"
-  #         TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-
-  #         # Parse migration options into flags
-  #         ARCHIVE_SOURCE="false"
-  #         if echo "$MIGRATION_OPTIONS" | grep -qi "Archive source repository"; then
-  #           ARCHIVE_SOURCE="true"
-  #         fi
-
-  #         # Parse admins into YAML array format
-  #         ADMINS_YAML=""
-  #         if [ -n "$ADMINS" ] && [ "$ADMINS" != "_No response_" ]; then
-  #           IFS=',' read -ra ADMIN_ITEMS <<< "$ADMINS"
-  #           for admin in "${ADMIN_ITEMS[@]}"; do
-  #             admin=$(echo "$admin" | xargs | sed 's/^@//')  # trim whitespace and @
-  #             if [ -n "$admin" ]; then
-  #               ADMINS_YAML="${ADMINS_YAML}      - ${admin}\n"
-  #             fi
-  #           done
-  #         fi
-
-  #         # Parse team mappings into YAML format
-  #         TEAMS_YAML=""
-  #         if [ -n "$TEAM_MAPPINGS" ] && [ "$TEAM_MAPPINGS" != "_No response_" ]; then
-  #           echo "$TEAM_MAPPINGS" | while IFS= read -r LINE; do
-  #             LINE=$(echo "$LINE" | xargs)
-  #             [ -z "$LINE" ] && continue
-  #             [[ "$LINE" == \#* ]] && continue
-
-  #             # Parse: source-team → target-team : permission
-  #             if echo "$LINE" | grep -q "→"; then
-  #               TARGET_PART=$(echo "$LINE" | sed 's/.*→//' | xargs)
-  #             elif echo "$LINE" | grep -q "->"; then
-  #               TARGET_PART=$(echo "$LINE" | sed 's/.*->//' | xargs)
-  #             else
-  #               continue
-  #             fi
-
-  #             if echo "$TARGET_PART" | grep -q ":"; then
-  #               TARGET_TEAM=$(echo "$TARGET_PART" | sed 's/:.*//' | xargs)
-  #               PERMISSION=$(echo "$TARGET_PART" | sed 's/.*://' | xargs)
-  #             else
-  #               TARGET_TEAM="$TARGET_PART"
-  #               PERMISSION="push"
-  #             fi
-
-  #             TEAMS_YAML="${TEAMS_YAML}      - team: ${TARGET_TEAM}\n"
-  #             TEAMS_YAML="${TEAMS_YAML}        permission: ${PERMISSION}\n"
-  #           done
-  #         fi
-
-  #         # Append migration entry to ghec-migration.yaml
-  #         {
-  #           echo ""
-  #           echo "  - source_organization: ${SOURCE_ORG}"
-  #           echo "    source_repository: ${SOURCE_REPO}"
-  #           echo "    target_organization: ${TARGET_ORG}"
-  #           echo "    target_repository: ${TARGET_REPO}"
-  #           echo "    target_visibility: ${TARGET_VISIBILITY}"
-  #           echo "    migration_options:"
-  #           echo "      archive_source: ${ARCHIVE_SOURCE}"
-  #           echo "    admins:"
-  #           if [ -n "$ADMINS_YAML" ]; then
-  #             echo -e "$ADMINS_YAML" | sed '/^$/d'
-  #           fi
-  #           if [ -n "$TEAMS_YAML" ]; then
-  #             echo "    teams:"
-  #             echo -e "$TEAMS_YAML" | sed '/^$/d'
-  #           fi
-  #           echo "    justification: \"${JUSTIFICATION}\""
-  #           echo "    issue_number: ${ISSUE_NUMBER}"
-  #           echo "    requested_at: ${TIMESTAMP}"
-  #           echo "    status: approved"
-  #         } >> data/ghec-migration.yaml
-
-  #         echo "✅ Successfully updated ghec-migration.yaml with migration configuration"
-
-  #     - name: Create branch and commit changes
-  #       id: create-branch
-  #       run: |
-  #         SOURCE_ORG="${{ needs.validate.outputs.source_organization }}"
-  #         SOURCE_REPO="${{ needs.validate.outputs.source_repo }}"
-  #         TARGET_ORG="${{ needs.validate.outputs.target_organization }}"
-  #         TARGET_REPO="${{ needs.validate.outputs.target_repo }}"
-  #         ADMINS="${{ needs.validate.outputs.admins }}"
-  #         TEAM_MAPPINGS="${{ needs.validate.outputs.team_mappings }}"
-  #         BRANCH_NAME="migration-request/${SOURCE_REPO}-to-${TARGET_ORG}"
-
-  #         # Delete remote branch if it exists (ignore errors)
-  #         git push origin --delete "${BRANCH_NAME}" 2>/dev/null || true
-
-  #         git checkout -b "${BRANCH_NAME}"
-  #         git add data/ghec-migration.yaml
-
-  #         # Build commit message with migration info
-  #         COMMIT_MSG="feat: 🚀 add GHEC migration config ${SOURCE_ORG}/${SOURCE_REPO} → ${TARGET_ORG}/${TARGET_REPO}
-
-  #         Migration request from issue #${{ github.event.issue.number }}
-
-  #         - Source: ${SOURCE_ORG}/${SOURCE_REPO}
-  #         - Target: ${TARGET_ORG}/${TARGET_REPO}
-  #         - Visibility: ${{ needs.validate.outputs.target_visibility }}
-  #         - Migration Options: ${{ needs.validate.outputs.migration_options }}"
-
-  #         if [ -n "$ADMINS" ] && [ "$ADMINS" != "_No response_" ]; then
-  #           COMMIT_MSG="${COMMIT_MSG}
-  #         - Admins: ${ADMINS}"
-  #         fi
-
-  #         if [ -n "$TEAM_MAPPINGS" ] && [ "$TEAM_MAPPINGS" != "_No response_" ]; then
-  #           COMMIT_MSG="${COMMIT_MSG}
-  #         - Team Mappings: Configured"
-  #         fi
-
-  #         COMMIT_MSG="${COMMIT_MSG}
-
-  #         Related to #${{ github.event.issue.number }}"
-
-  #         git commit -m "$COMMIT_MSG"
-  #         git push origin "${BRANCH_NAME}"
-
-  #         echo "branch=${BRANCH_NAME}" >> $GITHUB_OUTPUT
-
-  #     - name: Create Pull Request
-  #       id: create-pr
-  #       uses: actions/github-script@v7
-  #       with:
-  #         script: |
-  #           const sourceOrg = '${{ needs.validate.outputs.source_organization }}';
-  #           const sourceRepo = '${{ needs.validate.outputs.source_repo }}';
-  #           const targetOrg = '${{ needs.validate.outputs.target_organization }}';
-  #           const targetRepo = '${{ needs.validate.outputs.target_repo }}';
-  #           const targetVisibility = '${{ needs.validate.outputs.target_visibility }}';
-  #           const migrationOptions = '${{ needs.validate.outputs.migration_options }}';
-  #           const admins = '${{ needs.validate.outputs.admins }}';
-  #           const teamMappings = '${{ needs.validate.outputs.team_mappings }}';
-  #           const justification = '${{ needs.validate.outputs.justification }}';
-  #           const branchName = '${{ steps.create-branch.outputs.branch }}';
-  #           const issueNumber = context.issue.number;
-
-  #           const adminsList = admins && admins !== '_No response_'
-  #             ? admins.split(',').map(a => `\`${a.trim().replace(/^@/, '')}\``).join(', ')
-  #             : 'None';
-
-  #           const optionsList = migrationOptions
-  #             ? migrationOptions.split(',').map(o => `- ✅ ${o.trim()}`).join('\n')
-  #             : '- No additional options selected';
-
-  #           const teamSection = teamMappings && teamMappings !== '_No response_'
-  #             ? teamMappings.split('\n').filter(l => l.trim()).map(l => `- \`${l.trim()}\``).join('\n')
-  #             : '- No team mappings specified';
-
-  #           const prBody = `## 🚀 GHEC Migration Request
-
-  #           ### Migration Details
-
-  #           | Field | Value |
-  #           |-------|-------|
-  #           | **Source Repository** | \`${sourceOrg}/${sourceRepo}\` |
-  #           | **Target Repository** | \`${targetOrg}/${targetRepo}\` |
-  #           | **Target Visibility** | \`${targetVisibility}\` |
-  #           | **Admins** | ${adminsList} |
-  #           | **Requested By** | @${context.payload.issue.user.login} |
-
-  #           ### Migration Options
-
-  #           ${optionsList}
-
-  #           ### Team Access Mappings
-
-  #           ${teamSection}
-
-  #           ### Justification
-
-  #           > ${justification || 'No justification provided'}
-
-  #           ### Configuration
-
-  #           This PR adds the migration entry to:
-  #           - \`data/ghec-migration.yaml\`
-
-  #           ### Next Steps
-
-  #           1. ✅ Review the YAML changes
-  #           2. ✅ Merge this PR to apply changes
-  #           3. 📊 Pre-migration state recording
-  #           4. 🚀 Execute GEI migration
-  #           5. 🔧 Post-migration setup (admins, teams, branch protection)
-  #           6. ✅ Verification checks
-  #           7. 📦 Cutover and archive (if requested)
-
-  #           ---
-
-  #           Closes #${issueNumber}`;
-
-  #           const pr = await github.rest.pulls.create({
-  #             owner: context.repo.owner,
-  #             repo: context.repo.repo,
-  #             title: `🚀 GHEC Migration: ${sourceOrg}/${sourceRepo} → ${targetOrg}/${targetRepo}`,
-  #             head: branchName,
-  #             base: 'main',
-  #             body: prBody
-  #           });
-
-  #           core.setOutput('pr-number', pr.data.number);
-  #           core.setOutput('pr-url', pr.data.html_url);
-  #           return pr.data;
-
-  #     - name: Comment migration PR created
-  #       uses: peter-evans/create-or-update-comment@v4
-  #       with:
-  #         issue-number: ${{ github.event.issue.number }}
-  #         body: |
-  #           ### ✅ Migration Configuration Created
-
-  #           The migration request has been **approved** and a Pull Request has been created.
-
-  #           | Field | Value |
-  #           |-------|-------|
-  #           | **Source** | `${{ needs.validate.outputs.source_organization }}/${{ needs.validate.outputs.source_repo }}` |
-  #           | **Target** | `${{ needs.validate.outputs.target_organization }}/${{ needs.validate.outputs.target_repo }}` |
-  #           | **Visibility** | `${{ needs.validate.outputs.target_visibility }}` |
-  #           | **Admins** | `${{ needs.validate.outputs.admins }}` |
-  #           | **Pull Request** | #${{ steps.create-pr.outputs.pr-number }} |
-
-  #           ⏳ Proceeding to pre-migration setup once PR is merged...
-
-  #     - name: Add labels to PR
-  #       uses: actions/github-script@v7
-  #       with:
-  #         script: |
-  #           await github.rest.issues.addLabels({
-  #             owner: context.repo.owner,
-  #             repo: context.repo.repo,
-  #             issue_number: ${{ steps.create-pr.outputs.pr-number }},
-  #             labels: ['migration-request', 'automated']
-  #           });
-
-  #     - name: Generate PR creation summary
-  #       if: success()
-  #       uses: actions/github-script@v7
-  #       with:
-  #         script: |
-  #           const sourceOrg = '${{ needs.validate.outputs.source_organization }}';
-  #           const sourceRepo = '${{ needs.validate.outputs.source_repo }}';
-  #           const targetOrg = '${{ needs.validate.outputs.target_organization }}';
-  #           const targetRepo = '${{ needs.validate.outputs.target_repo }}';
-  #           const targetVisibility = '${{ needs.validate.outputs.target_visibility }}';
-  #           const migrationOptions = '${{ needs.validate.outputs.migration_options }}';
-  #           const admins = '${{ needs.validate.outputs.admins }}';
-  #           const teamMappings = '${{ needs.validate.outputs.team_mappings }}';
-  #           const justification = '${{ needs.validate.outputs.justification }}';
-  #           const prUrl = '${{ steps.create-pr.outputs.pr-url }}';
-  #           const prNumber = '${{ steps.create-pr.outputs.pr-number }}';
-
-  #           const adminsList = admins && admins !== '_No response_'
-  #             ? admins.split(',').map(a => a.trim().replace(/^@/, ''))
-  #             : [];
-
-  #           const optionsList = migrationOptions
-  #             ? migrationOptions.split(',').map(o => o.trim()).filter(o => o)
-  #             : [];
-
-  #           let summary = '# ✅ Pull Request Created Successfully!\n\n';
-  #           summary += '## 🚀 GHEC Migration Configuration Ready\n\n';
-  #           summary += '| Field | Value |\n';
-  #           summary += '|-------|-------|\n';
-  #           summary += `| **Source Repository** | \`${sourceOrg}/${sourceRepo}\` |\n`;
-  #           summary += `| **Target Repository** | \`${targetOrg}/${targetRepo}\` |\n`;
-  #           summary += `| **Target Visibility** | \`${targetVisibility}\` |\n`;
-  #           summary += `| **Admins** | ${adminsList.map(a => `\`${a}\``).join(', ') || 'None'} |\n`;
-  #           summary += `| **Pull Request** | [#${prNumber}](${prUrl}) |\n\n`;
-
-  #           if (optionsList.length > 0) {
-  #             summary += '## ⚙️ Migration Options\n\n';
-  #             for (const option of optionsList) {
-  #               summary += `- ✅ ${option}\n`;
-  #             }
-  #             summary += '\n';
-  #           }
-
-  #           if (adminsList.length > 0) {
-  #             summary += '## 👤 Admins\n\n';
-  #             summary += '| Admin | Permission | Status |\n';
-  #             summary += '|-------|------------|--------|\n';
-  #             for (const admin of adminsList) {
-  #               summary += `| \`${admin}\` | admin | Will be added post-migration |\n`;
-  #             }
-  #             summary += '\n';
-  #           }
-
-  #           if (teamMappings && teamMappings !== '_No response_') {
-  #             summary += '## 👥 Team Access Mappings\n\n';
-  #             summary += '```\n';
-  #             summary += teamMappings + '\n';
-  #             summary += '```\n\n';
-  #           }
-
-  #           if (justification && justification !== '_No response_') {
-  #             summary += '## 📝 Justification\n\n';
-  #             summary += `> ${justification}\n\n`;
-  #           }
-
-  #           summary += '## 📋 Next Steps\n\n';
-  #           summary += `1. 📝 Review the PR: [#${prNumber}](${prUrl})\n`;
-  #           summary += `2. ✅ Approve and merge the PR\n`;
-  #           summary += `3. 📊 Pre-migration state recording\n`;
-  #           summary += `4. 🚀 Execute GEI migration\n`;
-  #           summary += `5. 🔧 Post-migration setup (admins, teams, branch protection)\n`;
-  #           summary += `6. ✅ Verification checks\n`;
-  #           summary += `7. 📦 Cutover and archive (if requested)\n\n`;
-
-  #           summary += '---\n\n';
-  #           summary += `*PR created for issue #${context.issue.number}*\n`;
-
-  #           await core.summary
-  #             .addRaw(summary)
-  #             .write();
-
-  #     - name: Post success comment
-  #       if: success()
-  #       uses: actions/github-script@v7
-  #       with:
-  #         script: |
-  #           const sourceOrg = '${{ needs.validate.outputs.source_organization }}';
-  #           const sourceRepo = '${{ needs.validate.outputs.source_repo }}';
-  #           const targetOrg = '${{ needs.validate.outputs.target_organization }}';
-  #           const targetRepo = '${{ needs.validate.outputs.target_repo }}';
-  #           const targetVisibility = '${{ needs.validate.outputs.target_visibility }}';
-  #           const migrationOptions = '${{ needs.validate.outputs.migration_options }}';
-  #           const admins = '${{ needs.validate.outputs.admins }}';
-  #           const teamMappings = '${{ needs.validate.outputs.team_mappings }}';
-  #           const prUrl = '${{ steps.create-pr.outputs.pr-url }}';
-  #           const prNumber = '${{ steps.create-pr.outputs.pr-number }}';
-
-  #           const adminsList = admins && admins !== '_No response_'
-  #             ? admins.split(',').map(a => a.trim().replace(/^@/, ''))
-  #             : [];
-
-  #           const optionsList = migrationOptions
-  #             ? migrationOptions.split(',').map(o => o.trim()).filter(o => o)
-  #             : [];
-
-  #           let commentBody = `## ✅ Pull Request Created!
-
-  #           A pull request has been created to add your migration configuration.
-
-  #           ### 🚀 Migration Details
-  #           - **Source Repository:** \`${sourceOrg}/${sourceRepo}\`
-  #           - **Target Repository:** \`${targetOrg}/${targetRepo}\`
-  #           - **Target Visibility:** \`${targetVisibility}\`
-  #           - **Pull Request:** [#${prNumber}](${prUrl})
-
-  #           `;
-
-  #           if (optionsList.length > 0) {
-  #             commentBody += '### ⚙️ Migration Options\n';
-  #             for (const option of optionsList) {
-  #               commentBody += `- ✅ ${option}\n`;
-  #             }
-  #             commentBody += '\n';
-  #           }
-
-  #           if (adminsList.length > 0) {
-  #             commentBody += '### 👤 Admins\n';
-  #             for (const admin of adminsList) {
-  #               commentBody += `- \`${admin}\` - Admin access (will be added post-migration)\n`;
-  #             }
-  #             commentBody += '\n';
-  #           }
-
-  #           if (teamMappings && teamMappings !== '_No response_') {
-  #             commentBody += '### 👥 Team Access Mappings\n';
-  #             commentBody += '```\n';
-  #             commentBody += teamMappings + '\n';
-  #             commentBody += '```\n\n';
-  #           }
-
-  #           commentBody += `### 📋 Next Steps
-  #           1. 📝 Review the pull request: [#${prNumber}](${prUrl})
-  #           2. ✅ Approve and merge the PR
-  #           3. 📊 Pre-migration state recording
-  #           4. 🚀 Execute GEI migration
-  #           5. 🔧 Post-migration setup (admins, teams, branch protection)
-  #           6. ✅ Verification checks
-  #           7. 📦 Cutover and archive (if requested)
-
-  #           ---
-  #           *Automated by GitHub Actions workflow*`;
-
-  #           await github.rest.issues.createComment({
-  #             issue_number: context.issue.number,
-  #             owner: context.repo.owner,
-  #             repo: context.repo.repo,
-  #             body: commentBody
-  #           });
-
-  #           // Link issue to PR (will be closed when PR is merged)
-  #           await github.rest.issues.addLabels({
-  #             issue_number: context.issue.number,
-  #             owner: context.repo.owner,
-  #             repo: context.repo.repo,
-  #             labels: ['pr-created']
-  #           });
-
-  #     - name: Generate failure summary
-  #       if: failure()
-  #       uses: actions/github-script@v7
-  #       with:
-  #         script: |
-  #           const sourceOrg = '${{ needs.validate.outputs.source_organization }}';
-  #           const sourceRepo = '${{ needs.validate.outputs.source_repo }}';
-  #           const targetOrg = '${{ needs.validate.outputs.target_organization }}';
-  #           const targetRepo = '${{ needs.validate.outputs.target_repo }}';
-
-  #           let summary = '# ❌ Migration Configuration Failed\n\n';
-  #           summary += '## 🚨 Error Information\n\n';
-  #           summary += '| Field | Value |\n';
-  #           summary += '|-------|-------|\n';
-  #           summary += `| **Source Repository** | \`${sourceOrg}/${sourceRepo}\` |\n`;
-  #           summary += `| **Target Repository** | \`${targetOrg}/${targetRepo}\` |\n`;
-  #           summary += `| **Workflow Run** | [View Logs](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}) |\n`;
-  #           summary += `| **Issue** | #${context.issue.number} |\n\n`;
-
-  #           summary += '## 🔧 Troubleshooting Steps\n\n';
-  #           summary += '1. 📋 Check the workflow logs for detailed error messages\n';
-  #           summary += '2. 🔍 Verify that all required permissions are in place\n';
-  #           summary += '3. 🔑 Ensure GH_SOURCE_PAT and GH_TARGET_PAT secrets are valid\n';
-  #           summary += '4. 🔄 Ensure no manual changes conflict with automation\n';
-  #           summary += '5. 👥 Contact DevSecOps team for assistance\n\n';
-
-  #           summary += '---\n\n';
-  #           summary += '> ⚠️ A member of the DevSecOps team will investigate and follow up.\n';
-
-  #           await core.summary
-  #             .addRaw(summary)
-  #             .write();
-
-  #     - name: Post failure comment
-  #       if: failure()
-  #       uses: actions/github-script@v7
-  #       with:
-  #         script: |
-  #           const sourceOrg = '${{ needs.validate.outputs.source_organization }}';
-  #           const sourceRepo = '${{ needs.validate.outputs.source_repo }}';
-  #           const targetOrg = '${{ needs.validate.outputs.target_organization }}';
-  #           const targetRepo = '${{ needs.validate.outputs.target_repo }}';
-
-  #           const commentBody = `## ❌ Migration Configuration Failed
-
-  #           There was an error creating the migration configuration. Please check the workflow logs for details.
-
-  #           ### Error Details
-  #           - **Source Repository:** \`${sourceOrg}/${sourceRepo}\`
-  #           - **Target Repository:** \`${targetOrg}/${targetRepo}\`
-  #           - **Workflow Run:** [View Logs](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})
-  #           - **Step Failed:** Check the logs above
-
-  #           ### 🔧 Troubleshooting
-  #           A member of the DevSecOps team will investigate and follow up.
-
-  #           ---
-  #           *Automated by GitHub Actions workflow*`;
-
-  #           await github.rest.issues.createComment({
-  #             issue_number: context.issue.number,
-  #             owner: context.repo.owner,
-  #             repo: context.repo.repo,
-  #             body: commentBody
-  #           });
-
-  #           // Add failure label
-  #           await github.rest.issues.addLabels({
-  #             issue_number: context.issue.number,
-  #             owner: context.repo.owner,
-  #             repo: context.repo.repo,
-  #             labels: ['migration-failed']
-  #           });
+ 
+  # ─────────────────────────────────────────────
+  # Job 2: Dry Run — validate migration without executing
+  # ─────────────────────────────────────────────
+  dry-run:
+    name: "Migration Dry Run"
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+
+    steps:
+      - name: Install GEI CLI
+        run: |
+          gh extension install github/gh-gei || true
+          gh gei --version
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_TOKEN }}
+
+      - name: Run GEI dry run
+        id: dryrun
+        run: |
+          SRC_ORG="${{ needs.validate.outputs.source_organization }}"
+          SRC_REPO="${{ needs.validate.outputs.source_repo }}"
+          TGT_ORG="${{ needs.validate.outputs.target_organization }}"
+          TGT_REPO="${{ needs.validate.outputs.target_repo }}"
+          VISIBILITY="${{ needs.validate.outputs.target_visibility }}"
+
+          echo "🧪 Starting GEI dry run (GitHub.com → GitHub.com)..."
+          echo "   Source: ${SRC_ORG}/${SRC_REPO}"
+          echo "   Target: ${TGT_ORG}/${TGT_REPO}"
+          echo "   Visibility: ${VISIBILITY}"
+
+          gh gei migrate-repo \
+            --github-source-org "$SRC_ORG" \
+            --source-repo "$SRC_REPO" \
+            --github-target-org "$TGT_ORG" \
+            --target-repo "$TGT_REPO" \
+            --target-repo-visibility "$VISIBILITY" \
+            --dry-run \
+            --verbose 2>&1 | tee /tmp/gei_dryrun_output.txt
+
+          GEI_EXIT=$?
+          echo "exit_code=$GEI_EXIT" >> $GITHUB_OUTPUT
+
+          if [ "$GEI_EXIT" -ne 0 ]; then
+            echo "❌ GEI dry run failed"
+            exit 1
+          fi
+
+          echo "✅ GEI dry run completed successfully"
+        env:
+          GH_SOURCE_PAT: ${{ secrets.GH_PAT_TOKEN }}
+          GH_PAT: ${{ secrets.GH_PAT_TOKEN }}
+
+      - name: Comment dry run result
+        if: always()
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          issue-number: ${{ github.event.issue.number }}
+          body: |
+            ### 🧪 Migration Dry Run ${{ steps.dryrun.outcome == 'success' && '✅' || '❌' }}
+
+            **Status:** ${{ steps.dryrun.outcome == 'success' && 'Passed' || 'Failed' }}
+
+            | Field | Value |
+            |-------|-------|
+            | **Source** | `${{ needs.validate.outputs.source_organization }}/${{ needs.validate.outputs.source_repo }}` |
+            | **Target** | `${{ needs.validate.outputs.target_organization }}/${{ needs.validate.outputs.target_repo }}` |
+            | **Visibility** | `${{ needs.validate.outputs.target_visibility }}` |
+
+            ${{ steps.dryrun.outcome == 'success' && 'The dry run completed successfully. The migration is ready for approval.' || 'The dry run encountered errors. Please review and fix any issues before retrying.' }}
+
+            ---
+            *Automated by GitHub Actions workflow*
 
   # ─────────────────────────────────────────────
-  # Job 2: Approval Gate - requires manual approval after validation
+  # Job 3: Approval Gate - requires manual approval after validation & dry run
   # ─────────────────────────────────────────────
   approval:
     name: "Migration Approval Gate"
-    needs: validate
+    needs: [validate, dry-run]
     runs-on: ubuntu-latest
     environment:
       name: migration-approval
@@ -1010,7 +567,7 @@ jobs:
           body: |
             ### 🔐 Approval Required
 
-            Validation has passed. A manual approval is now required to proceed with the migration.
+            Validation and dry run have passed. A manual approval is now required to proceed with the migration.
 
             | Field | Value |
             |-------|-------|
@@ -2721,7 +2278,7 @@ jobs:
             }
 
             summary += '## 📦 Post-Migration Actions\n\n';
-            summary += `- ${archiveSource === 'true' ? '✅' : '⏭️'} Source repository archived after migration\n`;
+            summary += `- ${archiveSource === 'true' ? '✅ Source repository archived after migration' : '⏭️ Source repository archiving was not requested'}\n`;
             summary += `- ✅ Branch protection rules migrated from source\n`;
             summary += `- ✅ Migration manifest updated\n\n`;
 
@@ -2799,7 +2356,7 @@ jobs:
             | **HEAD SHA** | \`${sourceHeadSha.substring(0, 12)}\` | \`${sourceHeadSha.substring(0, 12)}\` | ✅ |
 
             ### 📦 Post-Migration Actions
-            - ${archiveSource === 'true' ? '✅' : '⏭️'} Source repository archived after migration
+            - ${archiveSource === 'true' ? '✅ Source repository archived after migration' : '⏭️ Source repository archiving was not requested'}
             - ✅ Branch protection rules migrated from source
             - ✅ Migration manifest updated${adminsSection}${optionsSection}
 
