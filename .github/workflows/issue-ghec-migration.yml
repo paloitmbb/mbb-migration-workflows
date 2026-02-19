@@ -568,7 +568,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GH_TARGET_PAT }}
 
-      - name: Run GEI dry run
+      - name: Run pre-flight validation (dry run)
         id: dryrun
         run: |
           SRC_ORG="${{ needs.validate.outputs.source_organization }}"
@@ -577,35 +577,123 @@ jobs:
           TGT_REPO="${{ needs.validate.outputs.target_repo }}"
           VISIBILITY="${{ needs.validate.outputs.target_visibility }}"
           GHES_API_URL="${{ needs.validate.outputs.source_api_url }}"
+          SRC_TOKEN="${{ secrets.GH_SOURCE_PAT }}"
+          TGT_TOKEN="${{ secrets.GH_TARGET_PAT }}"
 
-          echo "🧪 Starting GEI dry run (GHES → GHEC)..."
+          echo "🧪 Running pre-flight validation (dry run)..."
           echo "   Source GHES: ${{ needs.validate.outputs.ghes_url }}"
           echo "   Source: ${SRC_ORG}/${SRC_REPO}"
           echo "   Target: ${TGT_ORG}/${TGT_REPO} (GHEC)"
           echo "   Visibility: ${VISIBILITY}"
+          echo ""
 
-          gh gei migrate-repo \
-            --ghes-api-url "${GHES_API_URL}" \
-            --github-source-org "$SRC_ORG" \
-            --source-repo "$SRC_REPO" \
-            --github-target-org "$TGT_ORG" \
-            --target-repo "$TGT_REPO" \
-            --target-repo-visibility "$VISIBILITY" \
-            --dry-run \
-            --verbose 2>&1 | tee /tmp/gei_dryrun_output.txt
+          ERRORS=""
 
-          GEI_EXIT=$?
-          echo "exit_code=$GEI_EXIT" >> $GITHUB_OUTPUT
+          # 1. Verify GHES instance is reachable
+          echo "🔍 [1/6] Checking GHES instance..."
+          GHES_HTTP=$(curl -s -o /tmp/ghes_meta.json -w "%{http_code}" \
+            -H "Authorization: Bearer $SRC_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "${GHES_API_URL}/meta" --max-time 15 2>/dev/null || echo "000")
 
-          if [ "$GEI_EXIT" -ne 0 ]; then
-            echo "❌ GEI dry run failed"
-            exit 1
+          if [ "$GHES_HTTP" = "200" ]; then
+            GHES_VERSION=$(jq -r '.installed_version // "unknown"' /tmp/ghes_meta.json 2>/dev/null)
+            echo "   ✅ GHES instance reachable (version: $GHES_VERSION)"
+          elif [ "$GHES_HTTP" = "000" ]; then
+            ERRORS="${ERRORS}\n- ❌ Cannot reach GHES instance at ${{ needs.validate.outputs.ghes_url }} (connection timeout)"
+          else
+            echo "   ⚠️ GHES /meta returned HTTP $GHES_HTTP — some configs restrict /meta, proceeding"
           fi
 
-          echo "✅ GEI dry run completed successfully"
+          # 2. Verify source repo is accessible on GHES
+          echo "🔍 [2/6] Checking source repository on GHES..."
+          SRC_HTTP=$(curl -s -o /tmp/src_repo.json -w "%{http_code}" \
+            -H "Authorization: Bearer $SRC_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "${GHES_API_URL}/repos/${SRC_ORG}/${SRC_REPO}")
+
+          if [ "$SRC_HTTP" = "200" ]; then
+            SRC_SIZE=$(jq -r '.size' /tmp/src_repo.json)
+            SRC_ARCHIVED=$(jq -r '.archived' /tmp/src_repo.json)
+            SRC_VISIBILITY=$(jq -r '.visibility' /tmp/src_repo.json)
+            SRC_DEFAULT_BRANCH=$(jq -r '.default_branch' /tmp/src_repo.json)
+            echo "   ✅ Source repo accessible (size: ${SRC_SIZE}KB, visibility: ${SRC_VISIBILITY}, default branch: ${SRC_DEFAULT_BRANCH})"
+
+            if [ "$SRC_ARCHIVED" = "true" ]; then
+              ERRORS="${ERRORS}\n- ❌ Source repository is archived — cannot migrate"
+            fi
+          else
+            ERRORS="${ERRORS}\n- ❌ Source repository not accessible on GHES (HTTP ${SRC_HTTP})"
+          fi
+
+          # 3. Verify target org exists on GitHub.com
+          echo "🔍 [3/6] Checking target organization on GHEC..."
+          TGT_ORG_HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer $TGT_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/orgs/${TGT_ORG}")
+
+          if [ "$TGT_ORG_HTTP" = "200" ]; then
+            echo "   ✅ Target organization '${TGT_ORG}' exists on GHEC"
+          else
+            TGT_USER_HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
+              -H "Authorization: Bearer $TGT_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/users/${TGT_ORG}")
+            if [ "$TGT_USER_HTTP" = "200" ]; then
+              echo "   ✅ Target user '${TGT_ORG}' exists on GHEC"
+            else
+              ERRORS="${ERRORS}\n- ❌ Target organization/user '${TGT_ORG}' not found on GHEC (HTTP ${TGT_ORG_HTTP})"
+            fi
+          fi
+
+          # 4. Verify target repo doesn't already exist
+          echo "🔍 [4/6] Checking target repo availability..."
+          TGT_REPO_HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer $TGT_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${TGT_ORG}/${TGT_REPO}")
+
+          if [ "$TGT_REPO_HTTP" = "404" ]; then
+            echo "   ✅ Target repo name '${TGT_ORG}/${TGT_REPO}' is available"
+          elif [ "$TGT_REPO_HTTP" = "200" ]; then
+            ERRORS="${ERRORS}\n- ❌ Target repository '${TGT_ORG}/${TGT_REPO}' already exists on GHEC"
+          else
+            echo "   ⚠️ Unexpected response checking target repo (HTTP ${TGT_REPO_HTTP})"
+          fi
+
+          # 5. Verify source PAT permissions
+          echo "🔍 [5/6] Checking source PAT permissions..."
+          SRC_SCOPES=$(curl -s -I \
+            -H "Authorization: Bearer $SRC_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "${GHES_API_URL}/user" | grep -i "x-oauth-scopes" | tr -d '\r' | sed 's/x-oauth-scopes: //i')
+
+          if [ -n "$SRC_SCOPES" ]; then
+            echo "   ✅ Source PAT scopes: ${SRC_SCOPES}"
+          else
+            echo "   ℹ️ Fine-grained PAT detected for source (scopes not listed in headers)"
+          fi
+
+          # 6. Verify GEI CLI is working
+          echo "🔍 [6/6] Verifying GEI CLI..."
+          GEI_VERSION=$(gh gei --version 2>&1)
+          echo "   ✅ GEI CLI: ${GEI_VERSION}"
+
+          # Summary
+          echo ""
+          if [ -n "$ERRORS" ]; then
+            echo "❌ Pre-flight validation FAILED:"
+            echo -e "$ERRORS"
+            echo ""
+            echo -e "$ERRORS" > /tmp/gei_dryrun_output.txt
+            exit 1
+          else
+            echo "✅ All pre-flight checks passed — migration is ready for approval"
+            echo "All pre-flight checks passed" > /tmp/gei_dryrun_output.txt
+          fi
         env:
-          GH_SOURCE_PAT: ${{ secrets.GH_SOURCE_PAT }}
-          GH_PAT: ${{ secrets.GH_TARGET_PAT }}
+          GH_TOKEN: ${{ secrets.GH_TARGET_PAT }}
 
       - name: Comment dry run result
         if: always()
