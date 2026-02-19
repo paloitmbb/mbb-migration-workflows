@@ -1,0 +1,146 @@
+name: "MBB GitHub Enterprise Cloud Migration Request"
+description: "Request migration of a repository between GitHub.com accounts/organizations using GEI CLI"
+title: "[GHEC Migration] "
+labels: ["ghec-migration-request"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## MBB GitHub Enterprise Cloud Repository Migration
+        Use this form to request migration of a repository between GitHub.com accounts or organizations.
+
+        The workflow handles initiating the migration job, validating the target configuration,
+        and performing post-migration setup such as permissions and branch protection.
+
+        > **Prerequisites:**
+        > - Source repo must not be archived
+        > - Target organization/account must exist on GitHub.com
+        > - `GH_PAT_TOKEN` secret must have access to both source and target
+
+  - type: markdown
+    attributes:
+      value: |
+        ### Source (GitHub.com)
+
+  - type: input
+    id: source_organization
+    attributes:
+      label: "Source Organization"
+      description: "The organization name on source GitHub.com that owns the repository"
+      placeholder: "Source organization"
+    validations:
+      required: true
+
+  - type: input
+    id: source_repo
+    attributes:
+      label: "Source Repository Name"
+      description: "The exact repository name on GitHub.com to migrate"
+      placeholder: "Source repository name"
+    validations:
+      required: true
+
+  - type: markdown
+    attributes:
+      value: |
+        ### Target (GitHub.com)
+
+  - type: input
+    id: target_organization
+    attributes:
+      label: "Target Organization"
+      description: "The target GitHub.com organization where the repository will be migrated to"
+      placeholder: "Target organization"
+    validations:
+      required: true
+
+  - type: input
+    id: target_repo
+    attributes:
+      label: "Target Repository Name"
+      description: "Name for the repository at the destination (leave same as source if unchanged)"
+      placeholder: "Target repository name <org><region>-<dept>-<type>[tiering-optional]-<name>"
+    validations:
+      required: true
+      pattern:
+        value: '^[a-z0-9]+(-[a-z0-9]+)+$'
+        message: "Repository name must follow the naming convention (e.g., mbbmy-dbdo-app-mae-mobile). Use lowercase alphanumeric segments separated by hyphens."
+
+  - type: dropdown
+    id: target_visibility
+    attributes:
+      label: "Target Visibility"
+      description: "Visibility of the repository at the destination"
+      options:
+        - private
+        - internal
+        - public
+      default: 0
+    validations:
+      required: true
+
+  - type: markdown
+    attributes:
+      value: |
+        ### Migration Options
+
+  - type: checkboxes
+    id: migration_options
+    attributes:
+      label: "Migration Options"
+      description: "Select what to include in the migration"
+      options:
+        - label: "Preserve full commit history"
+          required: false
+        - label: "Migrate Pull Requests (open + closed)"
+          required: false
+        - label: "Migrate Issues (open + closed)"
+          required: false
+        - label: "Migrate Releases and tags"
+          required: false
+        - label: "Archive source repository after successful migration"
+          required: false
+
+  - type: input
+    id: admins
+    attributes:
+      label: "Admins"
+      description: "Comma-separated list of GitHub usernames who will be assigned admin access to the target repository after migration"
+      placeholder: "user1, user2, user3"
+    validations:
+      required: true
+
+  - type: textarea
+    id: team_mappings
+    attributes:
+      label: "Team Access Mappings (Optional)"
+      description: |
+        Map source teams to target teams for repository access. One mapping per line.
+        Format: `<source-team-slug> → <target-team-slug> : <permission>`
+        Permissions: pull, push, admin, maintain, triage
+      placeholder: |
+        dev-team → dev-team : push
+        platform-team → platform-team : admin
+        qa-team → qa-team : triage
+
+  - type: textarea
+    id: justification
+    attributes:
+      label: "Justification"
+      description: "Reason for initiating this migration"
+      placeholder: "e.g., Transferring repository to a new organization"
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: confirmation
+    attributes:
+      label: "Confirmation"
+      description: "Please confirm the following before submitting"
+      options:
+        - label: "I have verified the source repository name and owner/organization are correct"
+          required: true
+        - label: "I have notified the repository owners about this migration"
+          required: true
+        - label: "I understand there will be a brief freeze period during migration"
+          required: true
