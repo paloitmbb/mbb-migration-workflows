@@ -1626,16 +1626,60 @@ jobs:
 
           echo "🔑 Listing repository-level Actions secrets (names only — values cannot be read)..."
 
-          # Fetch repo-level Actions secret names
-          SECRETS_RESPONSE=$(curl -s \
+          ALL_SECRETS=""
+          SECRET_COUNT=0
+          ERROR_MSG=""
+
+          # Fetch repo-level Actions secret names (with HTTP status check)
+          HTTP_CODE=$(curl -s -o /tmp/secrets_response.json -w "%{http_code}" \
             -H "Authorization: Bearer $SRC_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${SRC_ORG}/${SRC_REPO}/actions/secrets")
 
-          SECRET_NAMES=$(echo "$SECRETS_RESPONSE" | jq -r '.secrets[]?.name // empty')
-          SECRET_COUNT=$(echo "$SECRETS_RESPONSE" | jq '.total_count // 0')
+          if [ "$HTTP_CODE" -eq 200 ]; then
+            REPO_SECRET_NAMES=$(cat /tmp/secrets_response.json | jq -r '.secrets[]?.name // empty')
+            REPO_SECRET_COUNT=$(cat /tmp/secrets_response.json | jq '.total_count // 0')
+            echo "   Found $REPO_SECRET_COUNT repository-level Actions secret(s)"
+            if [ "$REPO_SECRET_COUNT" -gt 0 ]; then
+              REPO_LIST=$(echo "$REPO_SECRET_NAMES" | tr '\n' ', ' | sed 's/,$//')
+              ALL_SECRETS="Repository-level: ${REPO_LIST}"
+              SECRET_COUNT=$((SECRET_COUNT + REPO_SECRET_COUNT))
+              echo "   Repository secrets: $REPO_LIST"
+            fi
+          else
+            API_MSG=$(cat /tmp/secrets_response.json | jq -r '.message // "Unknown error"')
+            echo "   ⚠️ Failed to list repo secrets (HTTP $HTTP_CODE): $API_MSG"
+            ERROR_MSG="Could not read repo-level secrets (HTTP $HTTP_CODE: $API_MSG)"
+          fi
 
-          echo "   Found $SECRET_COUNT repository-level Actions secret(s)"
+          # Fetch Dependabot secret names
+          HTTP_CODE=$(curl -s -o /tmp/dependabot_response.json -w "%{http_code}" \
+            -H "Authorization: Bearer $SRC_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${SRC_ORG}/${SRC_REPO}/dependabot/secrets")
+
+          if [ "$HTTP_CODE" -eq 200 ]; then
+            DEP_SECRET_NAMES=$(cat /tmp/dependabot_response.json | jq -r '.secrets[]?.name // empty')
+            DEP_SECRET_COUNT=$(cat /tmp/dependabot_response.json | jq '.total_count // 0')
+            echo "   Found $DEP_SECRET_COUNT Dependabot secret(s)"
+            if [ "$DEP_SECRET_COUNT" -gt 0 ]; then
+              DEP_LIST=$(echo "$DEP_SECRET_NAMES" | tr '\n' ', ' | sed 's/,$//')
+              if [ -n "$ALL_SECRETS" ]; then
+                ALL_SECRETS="${ALL_SECRETS} | Dependabot: ${DEP_LIST}"
+              else
+                ALL_SECRETS="Dependabot: ${DEP_LIST}"
+              fi
+              SECRET_COUNT=$((SECRET_COUNT + DEP_SECRET_COUNT))
+              echo "   Dependabot secrets: $DEP_LIST"
+            fi
+          else
+            echo "   ⚠️ Failed to list Dependabot secrets (HTTP $HTTP_CODE)"
+            if [ -n "$ERROR_MSG" ]; then
+              ERROR_MSG="${ERROR_MSG}; also could not read Dependabot secrets"
+            else
+              ERROR_MSG="Could not read Dependabot secrets (HTTP $HTTP_CODE)"
+            fi
+          fi
 
           # Also list environment-level secret names
           ENVS_RESPONSE=$(curl -s \
@@ -1657,15 +1701,15 @@ jobs:
           done
 
           # Build output for issue comment
-          if [ "$SECRET_COUNT" -gt 0 ]; then
-            SECRET_LIST=$(echo "$SECRET_NAMES" | tr '\n' ', ' | sed 's/,$//')
-            echo "secret_names=$SECRET_LIST" >> $GITHUB_OUTPUT
-            echo "   Repository secrets: $SECRET_LIST"
-          else
-            echo "secret_names=" >> $GITHUB_OUTPUT
-            echo "   No repository-level Actions secrets found"
-          fi
+          echo "secret_names=$ALL_SECRETS" >> $GITHUB_OUTPUT
           echo "secret_count=$SECRET_COUNT" >> $GITHUB_OUTPUT
+          if [ -n "$ERROR_MSG" ]; then
+            echo "secret_error=$ERROR_MSG" >> $GITHUB_OUTPUT
+          else
+            echo "secret_error=" >> $GITHUB_OUTPUT
+          fi
+
+          echo "   Total secrets found: $SECRET_COUNT"
 
       - name: Migrate Advanced Security permissions from source to target
         id: migrate-ghas
@@ -1923,7 +1967,7 @@ jobs:
             - ✅ Repository-level Actions variables migrated (${{ steps.migrate-repo-vars.outputs.repo_vars_count }} variables)
             - ⚠️ **Secrets must be re-created manually** (secret values are not readable via API)
 
-            ${{ steps.list-repo-secrets.outputs.secret_count != '0' && format('#### 🔑 Secrets requiring manual re-creation\n\nThe following secret **names** were found in the source repo. You must re-create them with their values:\n- Repository-level: `{0}`\n\nUse `gh secret set <NAME> --repo {1}/{2}` or the GitHub UI to set them.', steps.list-repo-secrets.outputs.secret_names, needs.validate.outputs.target_organization, needs.validate.outputs.target_repo) || '#### ✅ No repository-level secrets to re-create' }}
+            ${{ steps.list-repo-secrets.outputs.secret_error != '' && format('#### ⚠️ Could not list secrets\n\n{0}\n\nEnsure the PAT owner has **Admin** access to the source repo and (if using SAML SSO) has authorized the PAT for the org.', steps.list-repo-secrets.outputs.secret_error) || steps.list-repo-secrets.outputs.secret_count != '0' && format('#### 🔑 Secrets requiring manual re-creation\n\nThe following secret **names** were found in the source repo. You must re-create them with their values:\n- {0}\n\nUse `gh secret set <NAME> --repo {1}/{2}` or the GitHub UI to set them.', steps.list-repo-secrets.outputs.secret_names, needs.validate.outputs.target_organization, needs.validate.outputs.target_repo) || '#### ✅ No repository-level secrets to re-create' }}
 
             📋 Running verification checks...
 
