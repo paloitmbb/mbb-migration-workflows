@@ -1,33 +1,44 @@
-name: "GitHub.com → GitHub.com Migration Request"
-description: "Request migration of a repository between GitHub.com accounts/organizations using GEI CLI"
+name: "GHES → GHEC Migration Request"
+description: "Request migration of a repository from GitHub Enterprise Server (GHES) to GitHub Enterprise Cloud (GHEC) using GEI CLI"
 title: "[GHEC Migration] "
 labels: ["ghec-migration-request"]
 body:
   - type: markdown
     attributes:
       value: |
-        ## GitHub.com → GitHub.com Repository Migration
-        Use this form to request migration of a repository between GitHub.com accounts or organizations.
+        ## GHES → GHEC Repository Migration
+        Use this form to request migration of a repository from a **GitHub Enterprise Server (GHES)** instance to **GitHub Enterprise Cloud (GHEC)**.
 
-        The workflow handles initiating the migration job, validating the target configuration,
-        and performing post-migration setup such as permissions and branch protection.
+        The workflow handles validation, GEI migration, branch protection migration, GHAS settings, environment migration, and post-migration verification.
 
         > **Prerequisites:**
+        > - Source GHES instance must be reachable from GitHub Actions runners
         > - Source repo must not be archived
-        > - Target organization/account must exist on GitHub.com
-        > - `GH_PAT_TOKEN` secret must have access to both source and target
+        > - Target organization must exist on GitHub.com (GHEC)
+        > - Target repository name must not already be taken
+        > - `GH_SOURCE_PAT` secret must have read access to the source GHES repository
+        > - `GH_TARGET_PAT` secret must have write access to the target GHEC organization
 
   - type: markdown
     attributes:
       value: |
-        ### Source (GitHub.com)
+        ### Source (GHES)
+
+  - type: input
+    id: ghes_url
+    attributes:
+      label: "Source GHES URL"
+      description: "The base URL of your GitHub Enterprise Server instance (the API URL will be derived automatically)"
+      placeholder: "https://github.example.com"
+    validations:
+      required: true
 
   - type: input
     id: source_organization
     attributes:
       label: "Source Organization"
-      description: "The organization name on source GitHub.com that owns the repository"
-      placeholder: "akshhayasg"
+      description: "The organization or user on GHES that owns the repository"
+      placeholder: "my-org"
     validations:
       required: true
 
@@ -35,22 +46,22 @@ body:
     id: source_repo
     attributes:
       label: "Source Repository Name"
-      description: "The exact repository name on GitHub.com to migrate"
-      placeholder: "test"
+      description: "The exact repository name on GHES to migrate"
+      placeholder: "my-repo"
     validations:
       required: true
 
   - type: markdown
     attributes:
       value: |
-        ### Target (GitHub.com)
+        ### Target (GHEC)
 
   - type: input
     id: target_organization
     attributes:
       label: "Target Organization"
-      description: "The target GitHub.com organization where the repository will be migrated to"
-      placeholder: "lvjagadeesh"
+      description: "The target GitHub.com (GHEC) organization where the repository will be migrated to"
+      placeholder: "my-ghec-org"
     validations:
       required: true
 
@@ -58,8 +69,8 @@ body:
     id: target_repo
     attributes:
       label: "Target Repository Name"
-      description: "Name for the repository at the destination (leave same as source if unchanged)"
-      placeholder: "test"
+      description: "Name for the repository on GHEC. Must follow naming convention: lowercase alphanumeric segments separated by hyphens (e.g., mbbmy-dbdo-app-mae-mobile)"
+      placeholder: "my-migrated-repo"
     validations:
       required: true
 
@@ -67,7 +78,7 @@ body:
     id: target_visibility
     attributes:
       label: "Target Visibility"
-      description: "Visibility of the repository at the destination"
+      description: "Visibility of the repository on GHEC"
       options:
         - private
         - internal
@@ -85,34 +96,31 @@ body:
     id: migration_options
     attributes:
       label: "Migration Options"
-      description: "Select what to include in the migration"
+      description: "Select additional migration options"
       options:
-        - label: "Preserve full commit history"
-          required: false
-        - label: "Migrate Pull Requests (open + closed)"
-          required: false
-        - label: "Migrate Issues (open + closed)"
-          required: false
-        - label: "Migrate Releases and tags"
-          required: false
         - label: "Archive source repository after successful migration"
           required: false
+
+  - type: markdown
+    attributes:
+      value: |
+        ### Access & Permissions
 
   - type: input
     id: admins
     attributes:
       label: "Admins"
       description: "Comma-separated list of GitHub usernames who will be assigned admin access to the target repository after migration"
-      placeholder: "user1, user2, user3"
+      placeholder: "@user1, @user2, @user3"
     validations:
       required: true
 
   - type: textarea
     id: team_mappings
     attributes:
-      label: "Team Access Mappings (Optional)"
+      label: "Team Access Mappings"
       description: |
-        Map source teams to target teams for repository access. One mapping per line.
+        Map source teams to target teams for repository access on GHEC. One mapping per line.
         Format: `<source-team-slug> → <target-team-slug> : <permission>`
         Permissions: pull, push, admin, maintain, triage
       placeholder: |
@@ -124,8 +132,8 @@ body:
     id: justification
     attributes:
       label: "Justification"
-      description: "Reason for initiating this migration"
-      placeholder: "e.g., Transferring repository to a new organization"
+      description: "Reason for initiating this GHES → GHEC migration"
+      placeholder: "e.g., Migrating from on-premises GHES to cloud as part of infrastructure modernization"
     validations:
       required: true
 
@@ -135,7 +143,9 @@ body:
       label: "Confirmation"
       description: "Please confirm the following before submitting"
       options:
-        - label: "I have verified the source repository name and owner/organization are correct"
+        - label: "I have verified the source GHES URL, organization, and repository name are correct"
+          required: true
+        - label: "I have confirmed the GHES instance is reachable from GitHub Actions runners"
           required: true
         - label: "I have notified the repository owners about this migration"
           required: true
