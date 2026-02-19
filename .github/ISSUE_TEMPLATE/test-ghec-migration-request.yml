@@ -10,7 +10,7 @@ body:
         Use this form to request migration of a repository between GitHub.com accounts or organizations.
 
         The workflow handles initiating the migration job, validating the target configuration,
-        and performing post-migration setup such as permissions and branch protection.
+        performing a dry run to verify migration feasibility, and post-migration setup such as permissions and branch protection.
 
         > **Prerequisites:**
         > - Source repo must not be archived

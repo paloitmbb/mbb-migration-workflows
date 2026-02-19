@@ -334,7 +334,7 @@ jobs:
 
             const allValid = ghesUrl && sourceOrg && sourceRepo && targetOrg && targetRepo;
 
-            let commentBody = '## 🔍 GHES → GHEC Migration Request Validation\n\n';
+            let commentBody = '## 🔍 Github Migration Validation Request\n\n';
 
             if (allValid) {
               commentBody += '✅ **All validations passed!**\n\n';
@@ -471,7 +471,7 @@ jobs:
 
             const allValid = ghesUrl && sourceOrg && sourceRepo && targetOrg && targetRepo;
 
-            let summary = '# 🔍 GHES → GHEC Migration Request Validation\n\n';
+            let summary = '# 🔍 Github Migration Validation Request\n\n';
 
             if (allValid) {
               summary += '## ✅ All validations passed!\n\n';
@@ -551,11 +551,110 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   # ─────────────────────────────────────────────
-  # Job 2a: Notify that approval is required (runs immediately)
+  # Job 2: Dry Run — validate migration without executing
+  # ─────────────────────────────────────────────
+  dry-run:
+    name: "Migration Dry Run"
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+
+    steps:
+      - name: Install GEI CLI
+        run: |
+          gh extension install github/gh-gei || true
+          gh gei --version
+        env:
+          GH_TOKEN: ${{ secrets.GH_TARGET_PAT }}
+
+      - name: Run GEI dry run
+        id: dryrun
+        run: |
+          SRC_ORG="${{ needs.validate.outputs.source_organization }}"
+          SRC_REPO="${{ needs.validate.outputs.source_repo }}"
+          TGT_ORG="${{ needs.validate.outputs.target_organization }}"
+          TGT_REPO="${{ needs.validate.outputs.target_repo }}"
+          VISIBILITY="${{ needs.validate.outputs.target_visibility }}"
+          GHES_API_URL="${{ needs.validate.outputs.source_api_url }}"
+
+          echo "🧪 Starting GEI dry run (GHES → GHEC)..."
+          echo "   Source GHES: ${{ needs.validate.outputs.ghes_url }}"
+          echo "   Source: ${SRC_ORG}/${SRC_REPO}"
+          echo "   Target: ${TGT_ORG}/${TGT_REPO} (GHEC)"
+          echo "   Visibility: ${VISIBILITY}"
+
+          gh gei migrate-repo \
+            --ghes-api-url "${GHES_API_URL}" \
+            --github-source-org "$SRC_ORG" \
+            --source-repo "$SRC_REPO" \
+            --github-target-org "$TGT_ORG" \
+            --target-repo "$TGT_REPO" \
+            --target-repo-visibility "$VISIBILITY" \
+            --dry-run \
+            --verbose 2>&1 | tee /tmp/gei_dryrun_output.txt
+
+          GEI_EXIT=$?
+          echo "exit_code=$GEI_EXIT" >> $GITHUB_OUTPUT
+
+          if [ "$GEI_EXIT" -ne 0 ]; then
+            echo "❌ GEI dry run failed"
+            exit 1
+          fi
+
+          echo "✅ GEI dry run completed successfully"
+        env:
+          GH_SOURCE_PAT: ${{ secrets.GH_SOURCE_PAT }}
+          GH_PAT: ${{ secrets.GH_TARGET_PAT }}
+
+      - name: Comment dry run result
+        if: always()
+        run: |
+          DRYRUN_OUTPUT=$(cat /tmp/gei_dryrun_output.txt 2>/dev/null || echo "No output captured")
+          OUTCOME="${{ steps.dryrun.outcome }}"
+
+          if [ "$OUTCOME" = "success" ]; then
+            ICON="✅"
+            STATUS="Passed"
+            MESSAGE="The dry run completed successfully. The migration is ready for approval."
+          else
+            ICON="❌"
+            STATUS="Failed"
+            MESSAGE="The dry run encountered errors. Please review the output below and fix any issues before retrying."
+          fi
+
+          gh issue comment "${{ github.event.issue.number }}" --body "### 🧪 Migration Dry Run ${ICON}
+
+          **Status:** ${STATUS}
+
+          | Field | Value |
+          |-------|-------|
+          | **Source GHES** | \`${{ needs.validate.outputs.ghes_url }}\` |
+          | **Source** | \`${{ needs.validate.outputs.source_organization }}/${{ needs.validate.outputs.source_repo }}\` |
+          | **Target (GHEC)** | \`${{ needs.validate.outputs.target_organization }}/${{ needs.validate.outputs.target_repo }}\` |
+          | **Visibility** | \`${{ needs.validate.outputs.target_visibility }}\` |
+
+          ${MESSAGE}
+
+          <details><summary>Dry Run Output</summary>
+
+          \`\`\`
+          ${DRYRUN_OUTPUT}
+          \`\`\`
+
+          </details>
+
+          ---
+          *Automated by GitHub Actions workflow*"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ─────────────────────────────────────────────
+  # Job 3a: Notify that approval is required (runs immediately)
   # ─────────────────────────────────────────────
   approval-requested:
     name: "Notify Approval Required"
-    needs: validate
+    needs: [validate, dry-run]
     runs-on: ubuntu-latest
     permissions:
       issues: write
@@ -564,7 +663,7 @@ jobs:
         run: |
           gh issue comment "${{ github.event.issue.number }}" --body "### 🔐 Approval Required
 
-          Validation has passed. A manual approval is now required to proceed with the migration.
+          Validation and dry run have passed. A manual approval is now required to proceed with the migration.
 
           | Field | Value |
           |-------|-------|
@@ -581,11 +680,11 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   # ─────────────────────────────────────────────
-  # Job 2b: Approval Gate - requires manual approval
+  # Job 3b: Approval Gate - requires manual approval
   # ─────────────────────────────────────────────
   approval:
     name: "Migration Approval Gate"
-    needs: [validate, approval-requested]
+    needs: [validate, dry-run, approval-requested]
     runs-on: ubuntu-latest
     environment:
       name: migration-approval
@@ -1810,7 +1909,7 @@ jobs:
             }
 
             summary += '## 📦 Post-Migration Actions\n\n';
-            summary += `- ${archiveSource === 'true' ? '✅' : '⏭️'} Source repository archived after migration\n`;
+            summary += `- ${archiveSource === 'true' ? '✅ Source repository archived after migration' : '⏭️ Source repository archiving was not requested'}\n`;
             summary += `- ✅ Branch protection enabled on \`${defaultBranch}\`\n`;
             summary += `- ✅ Migration manifest updated\n\n`;
 
@@ -1888,7 +1987,7 @@ jobs:
             | **HEAD SHA** | \`${sourceHeadSha.substring(0, 12)}\` | \`${sourceHeadSha.substring(0, 12)}\` | ✅ |
 
             ### 📦 Post-Migration Actions
-            - ${archiveSource === 'true' ? '✅' : '⏭️'} Source repository archived after migration
+            - ${archiveSource === 'true' ? '✅ Source repository archived after migration' : '⏭️ Source repository archiving was not requested'}
             - ✅ Branch protection enabled on \`${defaultBranch}\`
             - ✅ Migration manifest updated${adminsSection}${optionsSection}
 
