@@ -1,8 +1,7 @@
-name: "MBB GitHub Enterprise Cloud Migration Workflow"
+name: "MBB GitHub Enterprise Cloud Migration Workflow (Test)"
 
 on:
-  issues:
-    types: [opened]
+  workflow_dispatch:
 
 # Uses separate PATs for source and target:
 # - GH_SOURCE_PAT: PAT with read access to source repository
