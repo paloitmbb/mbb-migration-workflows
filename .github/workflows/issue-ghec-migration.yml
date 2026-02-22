@@ -424,7 +424,7 @@ jobs:
   # ─────────────────────────────────────────────
   migrate:
     name: "Execute GEI Migration"
-    needs: [approval]
+    needs: [validate, approval]
     runs-on: ubuntu-latest
     permissions:
       issues: write
