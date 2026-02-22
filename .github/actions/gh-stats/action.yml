@@ -1,0 +1,226 @@
+name: "GitHub Repository Stats"
+description: "Gather repository statistics including branches, tags, PRs, issues, releases, and security feature status via the GitHub API"
+
+inputs:
+  repository:
+    description: "Full repository name (org/repo)"
+    required: true
+  token:
+    description: "GitHub PAT with read access to the repository"
+    required: true
+
+outputs:
+  repo_name:
+    description: "Full repository name (org/repo)"
+    value: ${{ steps.stats.outputs.repo_name }}
+  is_archived:
+    description: "Whether the repo is archived"
+    value: ${{ steps.stats.outputs.is_archived }}
+  repo_size:
+    description: "Repository size (human readable)"
+    value: ${{ steps.stats.outputs.repo_size }}
+  default_branch:
+    description: "Default branch name"
+    value: ${{ steps.stats.outputs.default_branch }}
+  head_sha:
+    description: "HEAD commit SHA of default branch"
+    value: ${{ steps.stats.outputs.head_sha }}
+  branches:
+    description: "Total number of branches"
+    value: ${{ steps.stats.outputs.branches }}
+  tags:
+    description: "Total number of tags"
+    value: ${{ steps.stats.outputs.tags }}
+  protected_branches:
+    description: "Number of protected branches"
+    value: ${{ steps.stats.outputs.protected_branches }}
+  pr_count:
+    description: "Total number of pull requests (all states)"
+    value: ${{ steps.stats.outputs.pr_count }}
+  issue_count:
+    description: "Total number of issues (all states)"
+    value: ${{ steps.stats.outputs.issue_count }}
+  release_count:
+    description: "Total number of releases"
+    value: ${{ steps.stats.outputs.release_count }}
+  code_scanning_enabled:
+    description: "Whether code scanning is enabled"
+    value: ${{ steps.stats.outputs.code_scanning_enabled }}
+  secret_scanning_enabled:
+    description: "Whether secret scanning is enabled"
+    value: ${{ steps.stats.outputs.secret_scanning_enabled }}
+  dependabot_alerts_enabled:
+    description: "Whether Dependabot alerts are enabled"
+    value: ${{ steps.stats.outputs.dependabot_alerts_enabled }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Gather repository stats
+      id: stats
+      shell: bash
+      run: |
+        REPO="${{ inputs.repository }}"
+        SRC_ORG="${REPO%%/*}"
+        SRC_REPO="${REPO##*/}"
+        TOKEN="${{ inputs.token }}"
+
+        echo "📊 Recording repository state for ${SRC_ORG}/${SRC_REPO}..."
+
+        # ── Repo metadata ──
+        REPO_JSON=$(curl -s \
+          -H "Authorization: Bearer $TOKEN" \
+          -H "Accept: application/vnd.github+json" \
+          "https://api.github.com/repos/${SRC_ORG}/${SRC_REPO}")
+
+        REPO_NAME=$(echo "$REPO_JSON" | jq -r '.full_name // "unknown"')
+        IS_ARCHIVED=$(echo "$REPO_JSON" | jq -r '.archived // false')
+        REPO_SIZE=$(echo "$REPO_JSON" | jq -r '.size // 0')
+        DEFAULT_BRANCH=$(echo "$REPO_JSON" | jq -r '.default_branch // "main"')
+
+        # Convert size to human readable
+        if [ "$REPO_SIZE" -ge 1048576 ]; then
+          REPO_SIZE_DISPLAY="$((REPO_SIZE / 1048576)) GB"
+        elif [ "$REPO_SIZE" -ge 1024 ]; then
+          REPO_SIZE_DISPLAY="$((REPO_SIZE / 1024)) MB"
+        else
+          REPO_SIZE_DISPLAY="${REPO_SIZE} KB"
+        fi
+
+        # ── Branch count (paginated) ──
+        BRANCH_PAGE=1
+        BRANCHES=0
+        while true; do
+          BRANCH_RESP=$(curl -s \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${SRC_ORG}/${SRC_REPO}/branches?per_page=100&page=${BRANCH_PAGE}")
+          COUNT=$(echo "$BRANCH_RESP" | jq 'length')
+          BRANCHES=$((BRANCHES + COUNT))
+          if [ "$COUNT" -lt 100 ]; then break; fi
+          BRANCH_PAGE=$((BRANCH_PAGE + 1))
+        done
+
+        # ── Tag count (paginated) ──
+        TAG_PAGE=1
+        TAGS=0
+        while true; do
+          TAG_RESP=$(curl -s \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${SRC_ORG}/${SRC_REPO}/tags?per_page=100&page=${TAG_PAGE}")
+          COUNT=$(echo "$TAG_RESP" | jq 'length')
+          TAGS=$((TAGS + COUNT))
+          if [ "$COUNT" -lt 100 ]; then break; fi
+          TAG_PAGE=$((TAG_PAGE + 1))
+        done
+
+        # ── HEAD SHA ──
+        HEAD_SHA=$(curl -s \
+          -H "Authorization: Bearer $TOKEN" \
+          -H "Accept: application/vnd.github+json" \
+          "https://api.github.com/repos/${SRC_ORG}/${SRC_REPO}/branches/${DEFAULT_BRANCH}" | jq -r '.commit.sha // "unknown"')
+
+        # ── Protected branch count (paginated) ──
+        PROTECTED_BRANCHES=0
+        PB_PAGE=1
+        while true; do
+          PB_RESP=$(curl -s \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${SRC_ORG}/${SRC_REPO}/branches?protected=true&per_page=100&page=${PB_PAGE}")
+          COUNT=$(echo "$PB_RESP" | jq 'if type == "array" then length else 0 end')
+          PROTECTED_BRANCHES=$((PROTECTED_BRANCHES + COUNT))
+          if [ "$COUNT" -lt 100 ]; then break; fi
+          PB_PAGE=$((PB_PAGE + 1))
+        done
+
+        # ── PR count (all states) ──
+        PR_COUNT=$(curl -s \
+          -H "Authorization: Bearer $TOKEN" \
+          -H "Accept: application/vnd.github+json" \
+          "https://api.github.com/search/issues?q=repo:${SRC_ORG}/${SRC_REPO}+type:pr" | jq -r '.total_count // 0')
+
+        # ── Issue count (all states) ──
+        ISSUE_COUNT=$(curl -s \
+          -H "Authorization: Bearer $TOKEN" \
+          -H "Accept: application/vnd.github+json" \
+          "https://api.github.com/search/issues?q=repo:${SRC_ORG}/${SRC_REPO}+type:issue" | jq -r '.total_count // 0')
+
+        # ── Release count ──
+        RELEASE_COUNT=$(curl -s \
+          -H "Authorization: Bearer $TOKEN" \
+          -H "Accept: application/vnd.github+json" \
+          "https://api.github.com/repos/${SRC_ORG}/${SRC_REPO}/releases?per_page=1")
+        RELEASE_TOTAL=$(curl -s -I \
+          -H "Authorization: Bearer $TOKEN" \
+          -H "Accept: application/vnd.github+json" \
+          "https://api.github.com/repos/${SRC_ORG}/${SRC_REPO}/releases?per_page=1" | \
+          grep -i '^link:' | sed -n 's/.*page=\([0-9]*\)>; rel="last".*/\1/p')
+        if [ -z "$RELEASE_TOTAL" ]; then
+          RELEASE_TOTAL=$(echo "$RELEASE_COUNT" | jq 'if type == "array" then length else 0 end')
+        fi
+
+        # ── Security features status ──
+        # Code Scanning
+        CS_RESP=$(curl -s -o /dev/null -w "%{http_code}" \
+          -H "Authorization: Bearer $TOKEN" \
+          -H "Accept: application/vnd.github+json" \
+          "https://api.github.com/repos/${SRC_ORG}/${SRC_REPO}/code-scanning/alerts?per_page=1")
+        if [ "$CS_RESP" = "200" ]; then
+          CODE_SCANNING_ENABLED="true"
+        else
+          CODE_SCANNING_ENABLED="false"
+        fi
+
+        # Secret Scanning
+        SECRET_SCANNING_STATUS=$(echo "$REPO_JSON" | jq -r '.security_and_analysis.secret_scanning.status // "disabled"')
+        if [ "$SECRET_SCANNING_STATUS" = "enabled" ]; then
+          SECRET_SCANNING_ENABLED="true"
+        else
+          SECRET_SCANNING_ENABLED="false"
+        fi
+
+        # Dependabot Alerts
+        DA_RESP=$(curl -s -o /dev/null -w "%{http_code}" \
+          -H "Authorization: Bearer $TOKEN" \
+          -H "Accept: application/vnd.github+json" \
+          "https://api.github.com/repos/${SRC_ORG}/${SRC_REPO}/vulnerability-alerts")
+        if [ "$DA_RESP" = "204" ]; then
+          DEPENDABOT_ALERTS_ENABLED="true"
+        else
+          DEPENDABOT_ALERTS_ENABLED="false"
+        fi
+
+        # ── Set all outputs ──
+        echo "repo_name=${REPO_NAME}" >> $GITHUB_OUTPUT
+        echo "is_archived=${IS_ARCHIVED}" >> $GITHUB_OUTPUT
+        echo "repo_size=${REPO_SIZE_DISPLAY}" >> $GITHUB_OUTPUT
+        echo "default_branch=${DEFAULT_BRANCH}" >> $GITHUB_OUTPUT
+        echo "head_sha=${HEAD_SHA}" >> $GITHUB_OUTPUT
+        echo "branches=${BRANCHES}" >> $GITHUB_OUTPUT
+        echo "tags=${TAGS}" >> $GITHUB_OUTPUT
+        echo "protected_branches=${PROTECTED_BRANCHES}" >> $GITHUB_OUTPUT
+        echo "pr_count=${PR_COUNT}" >> $GITHUB_OUTPUT
+        echo "issue_count=${ISSUE_COUNT}" >> $GITHUB_OUTPUT
+        echo "release_count=${RELEASE_TOTAL}" >> $GITHUB_OUTPUT
+        echo "code_scanning_enabled=${CODE_SCANNING_ENABLED}" >> $GITHUB_OUTPUT
+        echo "secret_scanning_enabled=${SECRET_SCANNING_ENABLED}" >> $GITHUB_OUTPUT
+        echo "dependabot_alerts_enabled=${DEPENDABOT_ALERTS_ENABLED}" >> $GITHUB_OUTPUT
+
+        echo ""
+        echo "📊 Repository state recorded:"
+        echo "   Repo: ${REPO_NAME}"
+        echo "   Archived: ${IS_ARCHIVED}"
+        echo "   Size: ${REPO_SIZE_DISPLAY}"
+        echo "   Default Branch: ${DEFAULT_BRANCH}"
+        echo "   HEAD SHA: ${HEAD_SHA:0:12}"
+        echo "   Branches: ${BRANCHES}"
+        echo "   Tags: ${TAGS}"
+        echo "   Protected Branches: ${PROTECTED_BRANCHES}"
+        echo "   PR Count: ${PR_COUNT}"
+        echo "   Issue Count: ${ISSUE_COUNT}"
+        echo "   Releases: ${RELEASE_TOTAL}"
+        echo "   Code Scanning: ${CODE_SCANNING_ENABLED}"
+        echo "   Secret Scanning: ${SECRET_SCANNING_ENABLED}"
+        echo "   Dependabot Alerts: ${DEPENDABOT_ALERTS_ENABLED}"
