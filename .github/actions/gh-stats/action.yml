@@ -156,7 +156,7 @@ runs:
           -H "Authorization: Bearer $TOKEN" \
           -H "Accept: application/vnd.github+json" \
           "https://api.github.com/repos/${SRC_ORG}/${SRC_REPO}/releases?per_page=1" | \
-          grep -i '^link:' | sed -n 's/.*page=\([0-9]*\)>; rel="last".*/\1/p')
+          grep -i '^link:' | sed -n 's/.*page=\([0-9]*\)>; rel="last".*/\1/p' || true)
         if [ -z "$RELEASE_TOTAL" ]; then
           RELEASE_TOTAL=$(echo "$RELEASE_COUNT" | jq 'if type == "array" then length else 0 end')
         fi

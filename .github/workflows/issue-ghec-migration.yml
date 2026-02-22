@@ -200,27 +200,7 @@ jobs:
 
       - name: Comment pre-migration state
         run: |
-          # Build security alerts section
-          SECURITY_SECTION=""
-          if [ "$TOTAL_ALERTS" -gt 0 ]; then
-            SECURITY_SECTION="### 🔐 Source Repository Security Alerts\n\n"
-
-            if [ "$DEP_COUNT" -gt 0 ]; then
-              SECURITY_SECTION+="**Dependabot Alerts ($DEP_COUNT)**\n\n${DEP_TABLE}\n\n"
-            fi
-
-            if [ "$CS_COUNT" -gt 0 ]; then
-              SECURITY_SECTION+="**Code Scanning Alerts ($CS_COUNT)**\n\n${CS_TABLE}\n\n"
-            fi
-
-            if [ "$SS_COUNT" -gt 0 ]; then
-              SECURITY_SECTION+="**Secret Scanning Alerts ($SS_COUNT)**\n\n${SS_TABLE}\n\n"
-            fi
-          else
-            SECURITY_SECTION="### 🔐 Source Repository Security Alerts\n\n✅ No open security alerts found.\n\n"
-          fi
-
-          BODY=$(printf "### 📊 Pre-Migration State Recorded\n\n| Metric | Value |\n|--------|-------|\n| **Repository** | \`${REPO_NAME}\` |\n| **Archived** | ${IS_ARCHIVED} |\n| **Size** | ${REPO_SIZE} |\n| **Default Branch** | ${DEFAULT_BRANCH} |\n| **HEAD SHA** | \`${HEAD_SHA}\` |\n| **Branches** | ${BRANCHES} |\n| **Tags** | ${TAGS} |\n| **Protected Branches** | ${PROTECTED_BRANCHES} |\n| **PR Count** | ${PR_COUNT} |\n| **Issue Count** | ${ISSUE_COUNT} |\n| **Releases** | ${RELEASE_COUNT} |\n| **Code Scanning** | ${CODE_SCANNING} |\n| **Secret Scanning** | ${SECRET_SCANNING} |\n| **Dependabot Alerts** | ${DEPENDABOT_ALERTS} |\n\n${SECURITY_SECTION}⏳ Starting GEI migration...")
+          BODY=$(printf "### 📊 Pre-Migration State Recorded\n\n| Metric | Value |\n|--------|-------|\n| **Repository** | \`${REPO_NAME}\` |\n| **Archived** | ${IS_ARCHIVED} |\n| **Size** | ${REPO_SIZE} |\n| **Default Branch** | ${DEFAULT_BRANCH} |\n| **HEAD SHA** | \`${HEAD_SHA}\` |\n| **Branches** | ${BRANCHES} |\n| **Tags** | ${TAGS} |\n| **Protected Branches** | ${PROTECTED_BRANCHES} |\n| **PR Count** | ${PR_COUNT} |\n| **Issue Count** | ${ISSUE_COUNT} |\n| **Releases** | ${RELEASE_COUNT} |\n| **Code Scanning** | ${CODE_SCANNING} |\n| **Secret Scanning** | ${SECRET_SCANNING} |\n| **Dependabot Alerts** | ${DEPENDABOT_ALERTS} |\n\n⏳ Starting GEI migration...")
 
           gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --body "$BODY"
         env:
@@ -240,13 +220,6 @@ jobs:
           CODE_SCANNING: ${{ steps.source-stats.outputs.code_scanning_enabled }}
           SECRET_SCANNING: ${{ steps.source-stats.outputs.secret_scanning_enabled }}
           DEPENDABOT_ALERTS: ${{ steps.source-stats.outputs.dependabot_alerts_enabled }}
-          DEP_TABLE: ${{ steps.security-alerts.outputs.dep_table }}
-          CS_TABLE: ${{ steps.security-alerts.outputs.cs_table }}
-          SS_TABLE: ${{ steps.security-alerts.outputs.ss_table }}
-          DEP_COUNT: ${{ steps.security-alerts.outputs.dep_count }}
-          CS_COUNT: ${{ steps.security-alerts.outputs.cs_count }}
-          SS_COUNT: ${{ steps.security-alerts.outputs.ss_count }}
-          TOTAL_ALERTS: ${{ steps.security-alerts.outputs.total_alerts }}
 
       - name: Post pre-migration summary
         uses: actions/github-script@v7
