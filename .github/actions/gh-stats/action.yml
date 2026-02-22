@@ -52,6 +52,21 @@ outputs:
   dependabot_alerts_enabled:
     description: "Whether Dependabot alerts are enabled"
     value: ${{ steps.stats.outputs.dependabot_alerts_enabled }}
+  last_push:
+    description: "Date/time when a push was last made"
+    value: ${{ steps.stats.outputs.last_push }}
+  last_update:
+    description: "Date/time when an update was last made"
+    value: ${{ steps.stats.outputs.last_update }}
+  pr_review_count:
+    description: "Number of pull request reviews"
+    value: ${{ steps.stats.outputs.pr_review_count }}
+  created:
+    description: "Date/time when the repository was created"
+    value: ${{ steps.stats.outputs.created }}
+  has_codeowners:
+    description: "Whether a CODEOWNERS file exists in the repository"
+    value: ${{ steps.stats.outputs.has_codeowners }}
 
 runs:
   using: "composite"
@@ -77,6 +92,9 @@ runs:
         IS_ARCHIVED=$(echo "$REPO_JSON" | jq -r '.archived // false')
         REPO_SIZE=$(echo "$REPO_JSON" | jq -r '.size // 0')
         DEFAULT_BRANCH=$(echo "$REPO_JSON" | jq -r '.default_branch // "main"')
+        LAST_PUSH=$(echo "$REPO_JSON" | jq -r '.pushed_at // "unknown"')
+        LAST_UPDATE=$(echo "$REPO_JSON" | jq -r '.updated_at // "unknown"')
+        CREATED=$(echo "$REPO_JSON" | jq -r '.created_at // "unknown"')
 
         # Convert size to human readable
         if [ "$REPO_SIZE" -ge 1048576 ]; then
@@ -161,6 +179,31 @@ runs:
           RELEASE_TOTAL=$(echo "$RELEASE_COUNT" | jq 'if type == "array" then length else 0 end')
         fi
 
+        # ── PR review count (paginated via search) ──
+        PR_REVIEW_COUNT=0
+        # List merged PRs and count those with at least one review
+        PR_REVIEW_PAGE=1
+        while true; do
+          PR_REVIEW_RESP=$(curl -s \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${SRC_ORG}/${SRC_REPO}/pulls?state=all&per_page=100&page=${PR_REVIEW_PAGE}")
+          PR_BATCH=$(echo "$PR_REVIEW_RESP" | jq 'if type == "array" then length else 0 end')
+          if [ "$PR_BATCH" -eq 0 ]; then break; fi
+          for PR_NUM in $(echo "$PR_REVIEW_RESP" | jq -r '.[].number'); do
+            REVIEWS=$(curl -s \
+              -H "Authorization: Bearer $TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${SRC_ORG}/${SRC_REPO}/pulls/${PR_NUM}/reviews?per_page=1")
+            REV_COUNT=$(echo "$REVIEWS" | jq 'if type == "array" then length else 0 end')
+            if [ "$REV_COUNT" -gt 0 ]; then
+              PR_REVIEW_COUNT=$((PR_REVIEW_COUNT + 1))
+            fi
+          done
+          if [ "$PR_BATCH" -lt 100 ]; then break; fi
+          PR_REVIEW_PAGE=$((PR_REVIEW_PAGE + 1))
+        done
+
         # ── Security features status ──
         # Code Scanning
         CS_RESP=$(curl -s -o /dev/null -w "%{http_code}" \
@@ -192,6 +235,23 @@ runs:
           DEPENDABOT_ALERTS_ENABLED="false"
         fi
 
+        # ── CODEOWNERS file check ──
+        HAS_CODEOWNERS="false"
+        for CODEOWNERS_PATH in "CODEOWNERS" ".github/CODEOWNERS" "docs/CODEOWNERS"; do
+          CO_RESP=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${SRC_ORG}/${SRC_REPO}/contents/${CODEOWNERS_PATH}")
+          if [ "$CO_RESP" = "200" ]; then
+            HAS_CODEOWNERS="true"
+            echo "   ✅ CODEOWNERS file found at ${CODEOWNERS_PATH}"
+            break
+          fi
+        done
+        if [ "$HAS_CODEOWNERS" = "false" ]; then
+          echo "   ⚠️ No CODEOWNERS file found in repository"
+        fi
+
         # ── Set all outputs ──
         echo "repo_name=${REPO_NAME}" >> $GITHUB_OUTPUT
         echo "is_archived=${IS_ARCHIVED}" >> $GITHUB_OUTPUT
@@ -207,6 +267,11 @@ runs:
         echo "code_scanning_enabled=${CODE_SCANNING_ENABLED}" >> $GITHUB_OUTPUT
         echo "secret_scanning_enabled=${SECRET_SCANNING_ENABLED}" >> $GITHUB_OUTPUT
         echo "dependabot_alerts_enabled=${DEPENDABOT_ALERTS_ENABLED}" >> $GITHUB_OUTPUT
+        echo "last_push=${LAST_PUSH}" >> $GITHUB_OUTPUT
+        echo "last_update=${LAST_UPDATE}" >> $GITHUB_OUTPUT
+        echo "pr_review_count=${PR_REVIEW_COUNT}" >> $GITHUB_OUTPUT
+        echo "created=${CREATED}" >> $GITHUB_OUTPUT
+        echo "has_codeowners=${HAS_CODEOWNERS}" >> $GITHUB_OUTPUT
 
         echo ""
         echo "📊 Repository state recorded:"
@@ -224,3 +289,8 @@ runs:
         echo "   Code Scanning: ${CODE_SCANNING_ENABLED}"
         echo "   Secret Scanning: ${SECRET_SCANNING_ENABLED}"
         echo "   Dependabot Alerts: ${DEPENDABOT_ALERTS_ENABLED}"
+        echo "   Last Push: ${LAST_PUSH}"
+        echo "   Last Update: ${LAST_UPDATE}"
+        echo "   PR Review Count: ${PR_REVIEW_COUNT}"
+        echo "   Created: ${CREATED}"
+        echo "   CODEOWNERS: ${HAS_CODEOWNERS}"

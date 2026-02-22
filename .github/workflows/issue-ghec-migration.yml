@@ -10,10 +10,10 @@ on:
 
 jobs:
   # ─────────────────────────────────────────────
-  # Job 1: Validate migration issue request
+  # Job 1: Validate migration request
   # ─────────────────────────────────────────────
   validate:
-    name: "Validate Migration Issue Request"
+    name: "Validate Migration Request"
     if: startsWith(github.event.issue.title, '[GHEC Migration]')
     runs-on: ubuntu-latest
     permissions:
@@ -58,92 +58,16 @@ jobs:
             ["migration_options"]
 
       - name: Validate source and target repositories
-        run: |
-          SRC_ORG="${{ steps.parse.outputs.issueparser_source_organization }}"
-          SRC_REPO="${{ steps.parse.outputs.issueparser_source_repo }}"
-          TGT_ORG="${{ steps.parse.outputs.issueparser_target_organization }}"
-          TGT_REPO="${{ steps.parse.outputs.issueparser_target_repo }}"
-          ISSUE_NUM="${{ github.event.issue.number }}"
-
-          ERRORS=""
-
-          # ── 1. Validate source repository exists ──
-          echo "🔍 Checking source: ${SRC_ORG}/${SRC_REPO} on GitHub..."
-
-          HTTP_CODE=$(curl -s -o /tmp/src_repo.json -w "%{http_code}" \
-            -H "Authorization: Bearer ${{ secrets.GH_SOURCE_PAT }}" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${SRC_ORG}/${SRC_REPO}")
-
-          if [ "$HTTP_CODE" != "200" ]; then
-            ERRORS="${ERRORS}\n- ❌ **Source repo** \`${SRC_ORG}/${SRC_REPO}\` not found on GitHub (HTTP ${HTTP_CODE}). Verify the repository name and that \`GH_SOURCE_PAT\` has read access."
-          else
-            ARCHIVED=$(jq -r '.archived' /tmp/src_repo.json)
-            if [ "$ARCHIVED" = "true" ]; then
-              ERRORS="${ERRORS}\n- ❌ **Source repo** \`${SRC_ORG}/${SRC_REPO}\` is **archived**. Cannot migrate an archived repository."
-            else
-              SIZE=$(jq -r '.size' /tmp/src_repo.json)
-              BRANCH=$(jq -r '.default_branch' /tmp/src_repo.json)
-              VISIBILITY=$(jq -r '.visibility' /tmp/src_repo.json)
-              echo "   ✅ Source repository verified (size: ${SIZE} KB, branch: ${BRANCH}, visibility: ${VISIBILITY})"
-            fi
-          fi
-
-          # ── 2. Validate target organization/user exists ──
-          echo "🔍 Checking target org: ${TGT_ORG} on GitHub.com..."
-
-          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-            -H "Authorization: Bearer ${{ secrets.GH_TARGET_PAT }}" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/orgs/${TGT_ORG}")
-
-          # Check if it's a user instead of an org
-          if [ "$HTTP_CODE" != "200" ]; then
-            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-              -H "Authorization: Bearer ${{ secrets.GH_TARGET_PAT }}" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/users/${TGT_ORG}")
-          fi
-
-          if [ "$HTTP_CODE" != "200" ]; then
-            ERRORS="${ERRORS}\n- ❌ **Target org/user** \`${TGT_ORG}\` not found on GitHub.com (HTTP ${HTTP_CODE}). Ensure the target organization or user exists."
-          else
-            echo "   ✅ Target organization/user '${TGT_ORG}' verified"
-          fi
-
-          # ── 3. Check target repo name is not already taken ──
-          echo "🔍 Checking target repo: ${TGT_ORG}/${TGT_REPO}..."
-
-          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-            -H "Authorization: Bearer ${{ secrets.GH_TARGET_PAT }}" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${TGT_ORG}/${TGT_REPO}")
-
-          if [ "$HTTP_CODE" = "200" ]; then
-            ERRORS="${ERRORS}\n- ❌ **Target repo** \`${TGT_ORG}/${TGT_REPO}\` **already exists** on GitHub.com. Choose a different name or delete the existing repository first."
-          elif [ "$HTTP_CODE" = "404" ]; then
-            echo "   ✅ Target repository name '${TGT_ORG}/${TGT_REPO}' is available — GEI will create it during migration"
-          else
-            ERRORS="${ERRORS}\n- ❌ **Target repo** \`${TGT_ORG}/${TGT_REPO}\` could not be verified (HTTP ${HTTP_CODE}). Ensure \`GH_TARGET_PAT\` has access to the target organization."
-          fi
-
-          # ── Report any errors ──
-          if [ -n "$ERRORS" ]; then
-            echo "::error::Repository validation failed"
-            gh issue comment "$ISSUE_NUM" \
-              --body "❌ **Repository Validation Failed**
-
-          The following checks did not pass:
-          $(echo -e "$ERRORS")
-
-          Please close this issue, fix the errors above, and submit a new request."
-            exit 1
-          fi
-
-          echo ""
-          echo "✅ All repository validations passed"
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        uses: ./.github/actions/validate-repos
+        with:
+          source-org: ${{ steps.parse.outputs.issueparser_source_organization }}
+          source-repo: ${{ steps.parse.outputs.issueparser_source_repo }}
+          target-org: ${{ steps.parse.outputs.issueparser_target_organization }}
+          target-repo: ${{ steps.parse.outputs.issueparser_target_repo }}
+          issue-number: ${{ github.event.issue.number }}
+          source-token: ${{ secrets.GH_SOURCE_PAT }}
+          target-token: ${{ secrets.GH_TARGET_PAT }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Label as in-progress
         run: |
@@ -173,6 +97,11 @@ jobs:
       source_release_count: ${{ steps.source-stats.outputs.release_count }}
       source_repo_size: ${{ steps.source-stats.outputs.repo_size }}
       source_is_archived: ${{ steps.source-stats.outputs.is_archived }}
+      source_last_push: ${{ steps.source-stats.outputs.last_push }}
+      source_last_update: ${{ steps.source-stats.outputs.last_update }}
+      source_pr_review_count: ${{ steps.source-stats.outputs.pr_review_count }}
+      source_created: ${{ steps.source-stats.outputs.created }}
+      source_has_codeowners: ${{ steps.source-stats.outputs.has_codeowners }}
       archive_source: ${{ steps.options.outputs.archive_source }}
 
     steps:
@@ -197,29 +126,6 @@ jobs:
         with:
           repository: ${{ needs.validate.outputs.source_organization }}/${{ needs.validate.outputs.source_repo }}
           token: ${{ secrets.GH_SOURCE_PAT }}
-
-      - name: Comment pre-migration state
-        run: |
-          BODY=$(printf "### 📊 Pre-Migration State Recorded\n\n| Metric | Value |\n|--------|-------|\n| **Repository** | \`${REPO_NAME}\` |\n| **Archived** | ${IS_ARCHIVED} |\n| **Size** | ${REPO_SIZE} |\n| **Default Branch** | ${DEFAULT_BRANCH} |\n| **HEAD SHA** | \`${HEAD_SHA}\` |\n| **Branches** | ${BRANCHES} |\n| **Tags** | ${TAGS} |\n| **Protected Branches** | ${PROTECTED_BRANCHES} |\n| **PR Count** | ${PR_COUNT} |\n| **Issue Count** | ${ISSUE_COUNT} |\n| **Releases** | ${RELEASE_COUNT} |\n| **Code Scanning** | ${CODE_SCANNING} |\n| **Secret Scanning** | ${SECRET_SCANNING} |\n| **Dependabot Alerts** | ${DEPENDABOT_ALERTS} |\n\n⏳ Starting GEI migration...")
-
-          gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --body "$BODY"
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          ISSUE_NUMBER: ${{ needs.validate.outputs.issue_number }}
-          REPO_NAME: ${{ steps.source-stats.outputs.repo_name }}
-          IS_ARCHIVED: ${{ steps.source-stats.outputs.is_archived }}
-          REPO_SIZE: ${{ steps.source-stats.outputs.repo_size }}
-          DEFAULT_BRANCH: ${{ steps.source-stats.outputs.default_branch }}
-          HEAD_SHA: ${{ steps.source-stats.outputs.head_sha }}
-          BRANCHES: ${{ steps.source-stats.outputs.branches }}
-          TAGS: ${{ steps.source-stats.outputs.tags }}
-          PROTECTED_BRANCHES: ${{ steps.source-stats.outputs.protected_branches }}
-          PR_COUNT: ${{ steps.source-stats.outputs.pr_count }}
-          ISSUE_COUNT: ${{ steps.source-stats.outputs.issue_count }}
-          RELEASE_COUNT: ${{ steps.source-stats.outputs.release_count }}
-          CODE_SCANNING: ${{ steps.source-stats.outputs.code_scanning_enabled }}
-          SECRET_SCANNING: ${{ steps.source-stats.outputs.secret_scanning_enabled }}
-          DEPENDABOT_ALERTS: ${{ steps.source-stats.outputs.dependabot_alerts_enabled }}
 
       - name: Post pre-migration summary
         uses: actions/github-script@v7
@@ -249,6 +155,11 @@ jobs:
             const codeScanningEnabled = '${{ steps.source-stats.outputs.code_scanning_enabled }}';
             const secretScanningEnabled = '${{ steps.source-stats.outputs.secret_scanning_enabled }}';
             const dependabotAlertsEnabled = '${{ steps.source-stats.outputs.dependabot_alerts_enabled }}';
+            const lastPush = '${{ steps.source-stats.outputs.last_push }}';
+            const lastUpdate = '${{ steps.source-stats.outputs.last_update }}';
+            const prReviewCount = '${{ steps.source-stats.outputs.pr_review_count }}';
+            const created = '${{ steps.source-stats.outputs.created }}';
+            const hasCodeowners = '${{ steps.source-stats.outputs.has_codeowners }}';
 
             // ── Build migration options block ──
             let optionsBlock = '';
@@ -297,19 +208,23 @@ jobs:
             commentBody += `| **Releases** | ${releaseCount} |\n`;
             commentBody += `| **Code Scanning** | ${codeScanningEnabled} |\n`;
             commentBody += `| **Secret Scanning** | ${secretScanningEnabled} |\n`;
-            commentBody += `| **Dependabot Alerts** | ${dependabotAlertsEnabled} |\n\n`;
+            commentBody += `| **Dependabot Alerts** | ${dependabotAlertsEnabled} |\n`;
+            commentBody += `| **Last Push** | ${lastPush} |\n`;
+            commentBody += `| **Last Update** | ${lastUpdate} |\n`;
+            commentBody += `| **PR Review Count** | ${prReviewCount} |\n`;
+            commentBody += `| **Created** | ${created} |\n`;
+            commentBody += `| **CODEOWNERS** | ${hasCodeowners === 'true' ? '✅ Present' : '⚠️ Not found'} |\n\n`;
+
+            if (hasCodeowners !== 'true') {
+              commentBody += '### ⚠️ CODEOWNERS Alert\n';
+              commentBody += '> **The CODEOWNERS file is not present in the source repository and it will be injected by default in the destination repo.**\n\n';
+            }
 
             if (optionsBlock) commentBody += '### ⚙️ Migration Options\n' + optionsBlock + '\n';
             if (teamBlock) commentBody += '### 👥 Team Access Mappings\n' + teamBlock + '\n';
             if (justificationBlock) commentBody += '### 📝 Justification\n' + justificationBlock + '\n';
             commentBody += '---\n\n';
-            commentBody += '⏳ **Awaiting approval to proceed with migration...**\n\n';
-            commentBody += '**Remaining Steps:**\n';
-            commentBody += '1. 🔐 Manual approval\n';
-            commentBody += '2. 🚀 Execute GEI migration\n';
-            commentBody += '3. 🔧 Post-migration setup\n';
-            commentBody += '4. ✅ Verification checks\n';
-            commentBody += '5. 📦 Cutover and cleanup\n';
+            commentBody += '⏳ **Awaiting approval to proceed with migration...**\n';
 
             await github.rest.issues.createComment({
               issue_number: context.issue.number,
@@ -352,18 +267,22 @@ jobs:
             summary += `| **Releases** | ${releaseCount} |\n`;
             summary += `| **Code Scanning** | ${codeScanningEnabled} |\n`;
             summary += `| **Secret Scanning** | ${secretScanningEnabled} |\n`;
-            summary += `| **Dependabot Alerts** | ${dependabotAlertsEnabled} |\n\n`;
+            summary += `| **Dependabot Alerts** | ${dependabotAlertsEnabled} |\n`;
+            summary += `| **Last Push** | ${lastPush} |\n`;
+            summary += `| **Last Update** | ${lastUpdate} |\n`;
+            summary += `| **PR Review Count** | ${prReviewCount} |\n`;
+            summary += `| **Created** | ${created} |\n`;
+            summary += `| **CODEOWNERS** | ${hasCodeowners === 'true' ? '✅ Present' : '⚠️ Not found'} |\n\n`;
+
+            if (hasCodeowners !== 'true') {
+              summary += '### ⚠️ CODEOWNERS Alert\n\n';
+              summary += '> **The CODEOWNERS file is not present in the source repository and it will be injected by default in the destination repo.**\n\n';
+            }
 
             if (optionsBlock) summary += '### ⚙️ Migration Options\n\n' + optionsBlock;
             if (teamBlock) summary += '\n### 👥 Team Access Mappings\n\n' + teamBlock;
             if (justificationBlock) summary += '\n### 📝 Justification\n\n' + justificationBlock;
-            summary += '\n---\n\n';
-            summary += '### ⏳ Remaining Steps\n\n';
-            summary += '1. 🔐 Manual approval\n';
-            summary += '2. 🚀 Execute GEI migration\n';
-            summary += '3. 🔧 Post-migration setup (admins, teams, branch protection)\n';
-            summary += '4. ✅ Verification checks\n';
-            summary += '5. 📦 Cutover and archive (if requested)\n';
+            summary += '\n---\n';
 
             await core.summary.addRaw(summary).write();
 
@@ -472,37 +391,6 @@ jobs:
           GH_SOURCE_PAT: ${{ secrets.GH_SOURCE_PAT }}
           GH_PAT: ${{ secrets.GH_TARGET_PAT }}
 
-      - name: Comment migration result
-        if: always()
-        run: |
-          if [ "$GEI_OUTCOME" = "success" ]; then
-            STATUS="✅"
-          else
-            STATUS="❌"
-          fi
-
-          GEI_LOG=$(cat /tmp/gei_output.txt 2>/dev/null || echo "No output captured")
-
-          gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --body "### GEI Migration ${STATUS}
-
-          **Source:** \`${SOURCE_ORG}/${SOURCE_REPO}\`
-          **Target:** \`${TARGET_ORG}/${TARGET_REPO}\`
-
-          <details><summary>GEI Output</summary>
-
-          \`\`\`
-          ${GEI_LOG}
-          \`\`\`
-
-          </details>"
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          ISSUE_NUMBER: ${{ needs.validate.outputs.issue_number }}
-          SOURCE_ORG: ${{ needs.validate.outputs.source_organization }}
-          SOURCE_REPO: ${{ needs.validate.outputs.source_repo }}
-          TARGET_ORG: ${{ needs.validate.outputs.target_organization }}
-          TARGET_REPO: ${{ needs.validate.outputs.target_repo }}
-          GEI_OUTCOME: ${{ steps.gei.outcome }}
 
   # ─────────────────────────────────────────────
   # Job 5: Post-migration setup
@@ -552,6 +440,51 @@ jobs:
               echo "   ⚠️ $ADMIN — HTTP $HTTP_CODE"
             fi
           done
+
+      - name: Inject CODEOWNERS file if not present in source
+        if: needs.pre-migration.outputs.source_has_codeowners != 'true'
+        run: |
+          TGT_ORG="${{ needs.validate.outputs.target_organization }}"
+          TGT_REPO="${{ needs.validate.outputs.target_repo }}"
+          ADMINS="${{ needs.validate.outputs.admins }}"
+          TOKEN="${{ secrets.GH_TARGET_PAT }}"
+          DEFAULT_BRANCH="${{ needs.pre-migration.outputs.source_default_branch }}"
+
+          echo "📝 CODEOWNERS file not found in source — creating one in target repo..."
+
+          # Build CODEOWNERS content from admin collaborators
+          OWNERS=""
+          IFS=',' read -ra ADMIN_ARRAY <<< "$ADMINS"
+          for RAW_ADMIN in "${ADMIN_ARRAY[@]}"; do
+            ADMIN=$(echo "$RAW_ADMIN" | xargs | sed 's/^@//')
+            if [ -z "$ADMIN" ]; then continue; fi
+            OWNERS="${OWNERS} @${ADMIN}"
+          done
+          OWNERS=$(echo "$OWNERS" | xargs)
+
+          if [ -z "$OWNERS" ]; then
+            echo "   ⚠️ No admin collaborators found — skipping CODEOWNERS creation"
+          else
+            CODEOWNERS_CONTENT="# This CODEOWNERS file was auto-generated during GHEC migration.\n# Source repository did not contain a CODEOWNERS file.\n# All files are owned by the admin collaborators listed below.\n\n* ${OWNERS}\n"
+
+            # Base64 encode the content
+            ENCODED_CONTENT=$(printf "$CODEOWNERS_CONTENT" | base64)
+
+            HTTP_CODE=$(curl -s -o /tmp/codeowners_response.json -w "%{http_code}" \
+              -X PUT \
+              -H "Authorization: Bearer $TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -H "Content-Type: application/json" \
+              -d "{\"message\": \"chore: add CODEOWNERS file (auto-generated during migration)\", \"content\": \"${ENCODED_CONTENT}\", \"branch\": \"${DEFAULT_BRANCH}\"}" \
+              "https://api.github.com/repos/${TGT_ORG}/${TGT_REPO}/contents/.github/CODEOWNERS")
+
+            if [[ "$HTTP_CODE" =~ ^2 ]]; then
+              echo "   ✅ CODEOWNERS file created at .github/CODEOWNERS with owners: ${OWNERS}"
+            else
+              ERROR_MSG=$(cat /tmp/codeowners_response.json | jq -r '.message // "Unknown error"')
+              echo "   ⚠️ Failed to create CODEOWNERS file — HTTP $HTTP_CODE — $ERROR_MSG"
+            fi
+          fi
 
       - name: Apply team access mappings
         if: needs.validate.outputs.team_mappings != ''
@@ -890,386 +823,7 @@ jobs:
           echo "branch_count=$BRANCH_COUNT" >> $GITHUB_OUTPUT
           rm -f "$MANUAL_ITEMS_FILE"
 
-      # # - name: Migrate rulesets from source to target
-      #   id: migrate-rulesets
-      #   run: |
-      #     SRC_ORG="${{ needs.validate.outputs.source_organization }}"
-      #     SRC_REPO="${{ needs.validate.outputs.source_repo }}"
-      #     TGT_ORG="${{ needs.validate.outputs.target_organization }}"
-      #     TGT_REPO="${{ needs.validate.outputs.target_repo }}"
-      #     SRC_TOKEN="${{ secrets.GH_SOURCE_PAT }}"
-      #     TGT_TOKEN="${{ secrets.GH_TARGET_PAT }}"
-
-      #     MIGRATED=0
-      #     FAILED=0
-      #     TOTAL=0
-      #     RULESET_SOURCE=""
-
-      #     echo "📏 Migrating rulesets from ${SRC_ORG}/${SRC_REPO} → ${TGT_ORG}/${TGT_REPO}..."
-
-      #     # ── Strategy 1: Try repo-level rulesets API ──
-      #     echo "   🔍 Attempting repo-level rulesets API..."
-      #     RULESETS=$(curl -s -w "\n%{http_code}" \
-      #       -H "Authorization: Bearer $SRC_TOKEN" \
-      #       -H "Accept: application/vnd.github+json" \
-      #       "https://api.github.com/repos/${SRC_ORG}/${SRC_REPO}/rulesets?includes_parents=false")
-
-      #     REPO_HTTP_CODE=$(echo "$RULESETS" | tail -1)
-      #     RULESETS=$(echo "$RULESETS" | sed '$d')
-
-      #     echo "   📋 Repo-level rulesets API returned HTTP $REPO_HTTP_CODE"
-
-      #     if [ "$REPO_HTTP_CODE" = "200" ] && echo "$RULESETS" | jq -e 'type == "array"' > /dev/null 2>&1; then
-      #       RULESET_COUNT=$(echo "$RULESETS" | jq 'length')
-      #       echo "   ✅ Repo-level API succeeded — found $RULESET_COUNT ruleset(s)"
-      #       RULESET_SOURCE="repo"
-      #     else
-      #       RULESET_COUNT=0
-      #       if echo "$RULESETS" | jq -e '.message' > /dev/null 2>&1; then
-      #         echo "   ⚠️ Repo-level API error: $(echo "$RULESETS" | jq -r '.message')"
-      #       fi
-
-      #       # ── Strategy 2: Fallback to org-level rulesets API ──
-      #       # On Free plans, repo-level rulesets API returns 403 but org-level may work.
-      #       # We fetch all org rulesets and filter for ones that apply to the source repo.
-      #       echo ""
-      #       echo "   🔄 Fallback: Trying org-level rulesets API for ${SRC_ORG}..."
-      #       ORG_RULESETS=$(curl -s -w "\n%{http_code}" \
-      #         -H "Authorization: Bearer $SRC_TOKEN" \
-      #         -H "Accept: application/vnd.github+json" \
-      #         "https://api.github.com/orgs/${SRC_ORG}/rulesets")
-
-      #       ORG_HTTP_CODE=$(echo "$ORG_RULESETS" | tail -1)
-      #       ORG_RULESETS=$(echo "$ORG_RULESETS" | sed '$d')
-
-      #       echo "   📋 Org-level rulesets API returned HTTP $ORG_HTTP_CODE"
-
-      #       if [ "$ORG_HTTP_CODE" = "200" ] && echo "$ORG_RULESETS" | jq -e 'type == "array"' > /dev/null 2>&1; then
-      #         ORG_RS_COUNT=$(echo "$ORG_RULESETS" | jq 'length')
-      #         echo "   Found $ORG_RS_COUNT org-level ruleset(s) total"
-
-      #         # For each org ruleset, fetch full details and check if it targets the source repo
-      #         MATCHING_RULESETS="[]"
-      #         if [ "$ORG_RS_COUNT" -gt 0 ]; then
-      #           echo "$ORG_RULESETS" | jq -c '.[]' | while IFS= read -r ORG_RS; do
-      #             ORG_RS_ID=$(echo "$ORG_RS" | jq -r '.id')
-      #             ORG_RS_NAME=$(echo "$ORG_RS" | jq -r '.name')
-
-      #             FULL_ORG_RS=$(curl -s \
-      #               -H "Authorization: Bearer $SRC_TOKEN" \
-      #               -H "Accept: application/vnd.github+json" \
-      #               "https://api.github.com/orgs/${SRC_ORG}/rulesets/${ORG_RS_ID}")
-
-      #             # Check if this ruleset targets our repo via conditions
-      #             # Org rulesets target repos via conditions.ref_name and conditions.repository_name
-      #             TARGETS_ALL=$(echo "$FULL_ORG_RS" | jq '
-      #               .conditions.repository_name == null or
-      #               (.conditions.repository_name.include // [] | any(. == "~ALL" or . == "*"))
-      #             ')
-      #             TARGETS_REPO=$(echo "$FULL_ORG_RS" | jq --arg repo "$SRC_REPO" '
-      #               .conditions.repository_name.include // [] | any(. == $repo or . == "~ALL" or . == "*")
-      #             ')
-      #             EXCLUDED=$(echo "$FULL_ORG_RS" | jq --arg repo "$SRC_REPO" '
-      #               .conditions.repository_name.exclude // [] | any(. == $repo)
-      #             ')
-
-      #             if { [ "$TARGETS_ALL" = "true" ] || [ "$TARGETS_REPO" = "true" ]; } && [ "$EXCLUDED" != "true" ]; then
-      #               echo "   ✅ Org ruleset '$ORG_RS_NAME' (ID: $ORG_RS_ID) applies to $SRC_REPO"
-      #               echo "$FULL_ORG_RS" >> /tmp/matching_org_rulesets.jsonl
-      #             else
-      #               echo "   ⏭️ Org ruleset '$ORG_RS_NAME' does not target $SRC_REPO — skipping"
-      #             fi
-      #           done
-
-      #           # Load matching rulesets
-      #           if [ -f /tmp/matching_org_rulesets.jsonl ]; then
-      #             RULESETS=$(cat /tmp/matching_org_rulesets.jsonl | jq -s '.')
-      #             RULESET_COUNT=$(echo "$RULESETS" | jq 'length')
-      #             RULESET_SOURCE="org"
-      #             echo "   Found $RULESET_COUNT org-level ruleset(s) applicable to $SRC_REPO"
-      #             rm -f /tmp/matching_org_rulesets.jsonl
-      #           else
-      #             RULESET_COUNT=0
-      #             echo "   ℹ️ No org-level rulesets apply to $SRC_REPO"
-      #           fi
-      #         fi
-      #       else
-      #         echo "   ⚠️ Org-level rulesets API also failed (HTTP $ORG_HTTP_CODE)"
-      #         if echo "$ORG_RULESETS" | jq -e '.message' > /dev/null 2>&1; then
-      #           echo "   Error: $(echo "$ORG_RULESETS" | jq -r '.message')"
-      #         fi
-      #         echo "   💡 Ensure GH_SOURCE_PAT has 'repo' scope (classic) or 'organization_administration:read' (fine-grained)"
-      #       fi
-      #     fi
-
-      #     echo ""
-      #     echo "   ℹ️ Note: This only counts rulesets (new GitHub rules), NOT classic branch protection rules."
-      #     echo "   ℹ️ Classic branch protection rules are migrated in the previous step."
-
-      #     if [ "$RULESET_COUNT" -eq 0 ] || [ -z "$RULESET_COUNT" ]; then
-      #       # Distinguish between "no rulesets exist" vs "API denied access"
-      #       if [ "$REPO_HTTP_CODE" = "403" ] && { [ -z "$ORG_HTTP_CODE" ] || [ "$ORG_HTTP_CODE" = "403" ]; }; then
-      #         echo "   ⚠️ Could not read rulesets — source plan does not support Rulesets API for private repos (HTTP 403)"
-      #         echo "   💡 Rulesets may exist but cannot be read. Upgrade source org to GitHub Team/Enterprise, or make the repo public temporarily."
-      #         echo "ruleset_status=denied" >> $GITHUB_OUTPUT
-      #         echo "ruleset_count=0" >> $GITHUB_OUTPUT
-      #         echo "ruleset_migrated=0" >> $GITHUB_OUTPUT
-      #         echo "ruleset_source=none" >> $GITHUB_OUTPUT
-      #       else
-      #         echo "   ℹ️ No rulesets to migrate"
-      #         echo "ruleset_status=skipped" >> $GITHUB_OUTPUT
-      #         echo "ruleset_count=0" >> $GITHUB_OUTPUT
-      #         echo "ruleset_migrated=0" >> $GITHUB_OUTPUT
-      #         echo "ruleset_source=none" >> $GITHUB_OUTPUT
-      #       fi
-      #     else
-      #       TOTAL=$RULESET_COUNT
-
-      #       # For org-level rulesets, we already have full details; for repo-level we need to fetch each
-      #       if [ "$RULESET_SOURCE" = "repo" ]; then
-      #         # Repo-level: iterate list, fetch full details per ID
-      #         echo "$RULESETS" | jq -c '.[]' | while IFS= read -r RS; do
-      #           RS_ID=$(echo "$RS" | jq -r '.id')
-      #           RS_NAME=$(echo "$RS" | jq -r '.name')
-
-      #           echo "   Processing ruleset: $RS_NAME (ID: $RS_ID)"
-
-      #           FULL_RS=$(curl -s \
-      #             -H "Authorization: Bearer $SRC_TOKEN" \
-      #             -H "Accept: application/vnd.github+json" \
-      #             "https://api.github.com/repos/${SRC_ORG}/${SRC_REPO}/rulesets/${RS_ID}")
-
-      #           # Build the payload for target — strip source-only fields
-      #           # Only keep RepositoryRole type bypass actors (portable across orgs)
-      #           CREATE_PAYLOAD=$(echo "$FULL_RS" | jq '
-      #             del(.id, .node_id, ._links, .source, .source_type, .created_at, .updated_at, .current_user_can_bypass) |
-      #             if .bypass_actors then
-      #               .bypass_actors = [.bypass_actors[] | select(.actor_type == "RepositoryRole")]
-      #             else . end
-      #           ')
-
-      #           echo "   📦 Ruleset payload for '$RS_NAME':"
-      #           echo "$CREATE_PAYLOAD" | jq . 2>/dev/null || echo "$CREATE_PAYLOAD"
-
-      #           HTTP_CODE=$(curl -s -o /tmp/rs_response.json -w "%{http_code}" \
-      #             -X POST \
-      #             -H "Authorization: Bearer $TGT_TOKEN" \
-      #             -H "Accept: application/vnd.github+json" \
-      #             -H "Content-Type: application/json" \
-      #             -d "$CREATE_PAYLOAD" \
-      #             "https://api.github.com/repos/${TGT_ORG}/${TGT_REPO}/rulesets")
-
-      #           if [ "$HTTP_CODE" = "201" ]; then
-      #             echo "   ✅ Ruleset '$RS_NAME' migrated successfully"
-      #             MIGRATED=$((MIGRATED + 1))
-      #           else
-      #             ERROR_MSG=$(cat /tmp/rs_response.json | jq -r '.message // "Unknown error"')
-      #             echo "   ⚠️ Ruleset '$RS_NAME' — HTTP $HTTP_CODE — $ERROR_MSG"
-      #             echo "   📋 Full response: $(cat /tmp/rs_response.json)"
-      #             FAILED=$((FAILED + 1))
-      #           fi
-      #         done
-      #       else
-      #         # Org-level: we already have full details, convert to repo-level rulesets
-      #         echo "$RULESETS" | jq -c '.[]' | while IFS= read -r FULL_RS; do
-      #           RS_NAME=$(echo "$FULL_RS" | jq -r '.name')
-
-      #           echo "   Processing org ruleset: $RS_NAME (converting to repo-level)"
-
-      #           # Convert org ruleset to repo-level: strip org-specific fields and conditions
-      #           # For repo-level creation, we need: name, target, enforcement, bypass_actors, conditions (ref_name only), rules
-      #           CREATE_PAYLOAD=$(echo "$FULL_RS" | jq '
-      #             {
-      #               name: .name,
-      #               target: (.target // "branch"),
-      #               enforcement: .enforcement,
-      #               bypass_actors: (if .bypass_actors then [.bypass_actors[] | select(.actor_type == "RepositoryRole")] else [] end),
-      #               conditions: (if .conditions.ref_name then {ref_name: .conditions.ref_name} else null end),
-      #               rules: .rules
-      #             } | with_entries(select(.value != null))
-      #           ')
-
-      #           echo "   📦 Ruleset payload for '$RS_NAME' (converted from org-level):"
-      #           echo "$CREATE_PAYLOAD" | jq . 2>/dev/null || echo "$CREATE_PAYLOAD"
-
-      #           HTTP_CODE=$(curl -s -o /tmp/rs_response.json -w "%{http_code}" \
-      #             -X POST \
-      #             -H "Authorization: Bearer $TGT_TOKEN" \
-      #             -H "Accept: application/vnd.github+json" \
-      #             -H "Content-Type: application/json" \
-      #             -d "$CREATE_PAYLOAD" \
-      #             "https://api.github.com/repos/${TGT_ORG}/${TGT_REPO}/rulesets")
-
-      #           if [ "$HTTP_CODE" = "201" ]; then
-      #             echo "   ✅ Ruleset '$RS_NAME' migrated successfully (org → repo-level)"
-      #             MIGRATED=$((MIGRATED + 1))
-      #           else
-      #             ERROR_MSG=$(cat /tmp/rs_response.json | jq -r '.message // "Unknown error"')
-      #             echo "   ⚠️ Ruleset '$RS_NAME' — HTTP $HTTP_CODE — $ERROR_MSG"
-      #             echo "   📋 Full response: $(cat /tmp/rs_response.json)"
-      #             FAILED=$((FAILED + 1))
-      #           fi
-      #         done
-      #       fi
-
-      #       echo ""
-      #       echo "   📊 Ruleset migration summary: $MIGRATED migrated, $FAILED failed out of $TOTAL total"
-
-      #       if [ "$FAILED" -gt 0 ]; then
-      #         echo "ruleset_status=partial" >> $GITHUB_OUTPUT
-      #       else
-      #         echo "ruleset_status=success" >> $GITHUB_OUTPUT
-      #       fi
-      #       echo "ruleset_count=$TOTAL" >> $GITHUB_OUTPUT
-      #       echo "ruleset_migrated=$MIGRATED" >> $GITHUB_OUTPUT
-      #       echo "ruleset_source=$RULESET_SOURCE" >> $GITHUB_OUTPUT
-      #     fi
-
-      # - name: Migrate environments from source to target
-      #   run: |
-      #     SRC_ORG="${{ needs.validate.outputs.source_organization }}"
-      #     SRC_REPO="${{ needs.validate.outputs.source_repo }}"
-      #     TGT_ORG="${{ needs.validate.outputs.target_organization }}"
-      #     TGT_REPO="${{ needs.validate.outputs.target_repo }}"
-      #     SRC_TOKEN="${{ secrets.GH_SOURCE_PAT }}"
-      #     TGT_TOKEN="${{ secrets.GH_TARGET_PAT }}"
-
-      #     echo "🌍 Migrating environments from ${SRC_ORG}/${SRC_REPO} → ${TGT_ORG}/${TGT_REPO}..."
-
-      #     # Fetch all environments from source repo
-      #     ENVS_RESPONSE=$(curl -s \
-      #       -H "Authorization: Bearer $SRC_TOKEN" \
-      #       -H "Accept: application/vnd.github+json" \
-      #       "https://api.github.com/repos/${SRC_ORG}/${SRC_REPO}/environments")
-
-      #     ENV_COUNT=$(echo "$ENVS_RESPONSE" | jq '.total_count // 0')
-      #     echo "   Found $ENV_COUNT environment(s) in source repo"
-
-      #     if [ "$ENV_COUNT" -eq 0 ]; then
-      #       echo "   ℹ️ No environments to migrate"
-      #     else
-      #       echo "$ENVS_RESPONSE" | jq -c '.environments[]' | while IFS= read -r ENV; do
-      #         ENV_NAME=$(echo "$ENV" | jq -r '.name')
-      #         echo "   Processing environment: $ENV_NAME"
-
-      #         # Extract protection rules
-      #         WAIT_TIMER=$(echo "$ENV" | jq '.protection_rules[]? | select(.type == "wait_timer") | .wait_timer // empty')
-      #         PREVENT_SELF_REVIEW=$(echo "$ENV" | jq '.protection_rules[]? | select(.type == "required_reviewers") | .prevent_self_review // false')
-
-      #         # Extract reviewer IDs (users and teams)
-      #         REVIEWERS=$(echo "$ENV" | jq '[.protection_rules[]? | select(.type == "required_reviewers") | .reviewers[]? | {type: .type, id: .reviewer.id}]')
-
-      #         # Extract deployment branch policy
-      #         DEPLOYMENT_POLICY=$(echo "$ENV" | jq '.deployment_branch_policy // null')
-
-      #         # Build the create/update payload
-      #         PAYLOAD="{}"
-
-      #         # Add wait timer if present
-      #         if [ -n "$WAIT_TIMER" ] && [ "$WAIT_TIMER" != "null" ]; then
-      #           PAYLOAD=$(echo "$PAYLOAD" | jq --argjson wt "$WAIT_TIMER" '. + {wait_timer: $wt}')
-      #         fi
-
-      #         # Add prevent self review
-      #         if [ -n "$PREVENT_SELF_REVIEW" ] && [ "$PREVENT_SELF_REVIEW" != "null" ]; then
-      #           PAYLOAD=$(echo "$PAYLOAD" | jq --argjson psr "$PREVENT_SELF_REVIEW" '. + {prevent_self_review: $psr}')
-      #         fi
-
-      #         # Add reviewers if present
-      #         REVIEWER_COUNT=$(echo "$REVIEWERS" | jq 'length')
-      #         if [ "$REVIEWER_COUNT" -gt 0 ]; then
-      #           PAYLOAD=$(echo "$PAYLOAD" | jq --argjson rev "$REVIEWERS" '. + {reviewers: $rev}')
-      #         fi
-
-      #         # Add deployment branch policy if present
-      #         if [ "$DEPLOYMENT_POLICY" != "null" ] && [ -n "$DEPLOYMENT_POLICY" ]; then
-      #           PAYLOAD=$(echo "$PAYLOAD" | jq --argjson dp "$DEPLOYMENT_POLICY" '. + {deployment_branch_policy: $dp}')
-      #         fi
-
-      #         # Create or update environment in target repo
-      #         HTTP_CODE=$(curl -s -o /tmp/env_response.json -w "%{http_code}" \
-      #           -X PUT \
-      #           -H "Authorization: Bearer $TGT_TOKEN" \
-      #           -H "Accept: application/vnd.github+json" \
-      #           -H "Content-Type: application/json" \
-      #           -d "$PAYLOAD" \
-      #           "https://api.github.com/repos/${TGT_ORG}/${TGT_REPO}/environments/${ENV_NAME}")
-
-      #         if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "201" ]; then
-      #           echo "   ✅ Environment '$ENV_NAME' migrated successfully"
-
-      #           # If custom branch policies exist, migrate deployment branch patterns
-      #           CUSTOM_POLICIES=$(echo "$DEPLOYMENT_POLICY" | jq -r '.custom_branch_policies // false')
-      #           if [ "$CUSTOM_POLICIES" = "true" ]; then
-      #             echo "      Migrating custom deployment branch policies..."
-
-      #             # Fetch branch policies from source
-      #             BRANCH_POLICIES=$(curl -s \
-      #               -H "Authorization: Bearer $SRC_TOKEN" \
-      #               -H "Accept: application/vnd.github+json" \
-      #               "https://api.github.com/repos/${SRC_ORG}/${SRC_REPO}/environments/${ENV_NAME}/deployment-branch-policies")
-
-      #             echo "$BRANCH_POLICIES" | jq -c '.branch_policies[]?' | while IFS= read -r BP; do
-      #               BP_NAME=$(echo "$BP" | jq -r '.name')
-      #               BP_TYPE=$(echo "$BP" | jq -r '.type // "branch"')
-
-      #               BP_HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
-      #                 -X POST \
-      #                 -H "Authorization: Bearer $TGT_TOKEN" \
-      #                 -H "Accept: application/vnd.github+json" \
-      #                 -H "Content-Type: application/json" \
-      #                 -d "{\"name\": \"${BP_NAME}\", \"type\": \"${BP_TYPE}\"}" \
-      #                 "https://api.github.com/repos/${TGT_ORG}/${TGT_REPO}/environments/${ENV_NAME}/deployment-branch-policies")
-
-      #               if [ "$BP_HTTP" = "200" ] || [ "$BP_HTTP" = "201" ]; then
-      #                 echo "      ✅ Branch policy '$BP_NAME' ($BP_TYPE) added"
-      #               else
-      #                 echo "      ⚠️ Branch policy '$BP_NAME' — HTTP $BP_HTTP"
-      #               fi
-      #             done
-      #           fi
-      #           # Migrate environment variables (these ARE readable via API)
-      #           echo "      Migrating environment variables..."
-      #           VARS_RESPONSE=$(curl -s \
-      #             -H "Authorization: Bearer $SRC_TOKEN" \
-      #             -H "Accept: application/vnd.github+json" \
-      #             "https://api.github.com/repos/${SRC_ORG}/${SRC_REPO}/environments/${ENV_NAME}/variables")
-
-      #           VAR_COUNT=$(echo "$VARS_RESPONSE" | jq '.total_count // 0')
-      #           if [ "$VAR_COUNT" -gt 0 ]; then
-      #             echo "$VARS_RESPONSE" | jq -c '.variables[]?' | while IFS= read -r VAR; do
-      #               VAR_NAME=$(echo "$VAR" | jq -r '.name')
-      #               VAR_VALUE=$(echo "$VAR" | jq -r '.value')
-
-      #               VAR_HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
-      #                 -X POST \
-      #                 -H "Authorization: Bearer $TGT_TOKEN" \
-      #                 -H "Accept: application/vnd.github+json" \
-      #                 -H "Content-Type: application/json" \
-      #                 -d "{\"name\": \"${VAR_NAME}\", \"value\": \"${VAR_VALUE}\"}" \
-      #                 "https://api.github.com/repos/${TGT_ORG}/${TGT_REPO}/environments/${ENV_NAME}/variables")
-
-      #               if [ "$VAR_HTTP" = "201" ]; then
-      #                 echo "      ✅ Variable '$VAR_NAME' migrated"
-      #               else
-      #                 echo "      ⚠️ Variable '$VAR_NAME' — HTTP $VAR_HTTP"
-      #               fi
-      #             done
-      #           else
-      #             echo "      ℹ️ No environment variables to migrate"
-      #           fi
-      #         else
-      #           ERROR_MSG=$(cat /tmp/env_response.json | jq -r '.message // "Unknown error"')
-      #           echo "   ⚠️ Environment '$ENV_NAME' — HTTP $HTTP_CODE — $ERROR_MSG"
-      #         fi
-      #       done
-      #     fi
-
-      #     echo ""
-      #     echo "⚠️ Note: Environment secrets cannot be read via API and must be re-created manually."
-      #     echo "   Environment variables have been migrated automatically."
-
-      - name: Migrate repository-level Actions variables
+      - name: Migrate variables
         id: migrate-repo-vars
         run: |
           SRC_ORG="${{ needs.validate.outputs.source_organization }}"
@@ -1321,7 +875,7 @@ jobs:
           echo "   Total repo-level Actions variables migrated: $TOTAL_MIGRATED"
           echo "repo_vars_count=$TOTAL_MIGRATED" >> $GITHUB_OUTPUT
 
-      - name: List repository-level Actions secret names
+      - name: List Secret Names
         id: list-repo-secrets
         run: |
           SRC_ORG="${{ needs.validate.outputs.source_organization }}"

@@ -1,0 +1,337 @@
+name: "Migrate Branch Protection Rules"
+description: "Migrate branch protection rules from a source repository to a target repository via the GitHub API. Handles protected and non-enforced rules, required status checks, PR reviews, and required signatures."
+
+inputs:
+  source-org:
+    description: "Source organization name"
+    required: true
+  source-repo:
+    description: "Source repository name"
+    required: true
+  target-org:
+    description: "Target organization or user name"
+    required: true
+  target-repo:
+    description: "Target repository name"
+    required: true
+  source-token:
+    description: "PAT with read access to the source repository (requires repo scope or administration:read)"
+    required: true
+  target-token:
+    description: "PAT with write access to the target repository (requires repo scope or administration:write)"
+    required: true
+
+outputs:
+  migrated_count:
+    description: "Number of branches whose protection rules were successfully migrated"
+    value: ${{ steps.migrate.outputs.migrated_count }}
+  branch_count:
+    description: "Total number of branches with protection rules found in source"
+    value: ${{ steps.migrate.outputs.branch_count }}
+  manual_items:
+    description: "Multiline string of branch protection settings that require manual re-configuration (empty if none)"
+    value: ${{ steps.migrate.outputs.manual_items }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Migrate branch protection rules
+      id: migrate
+      shell: bash
+      run: |
+        SRC_ORG="${{ inputs.source-org }}"
+        SRC_REPO="${{ inputs.source-repo }}"
+        TGT_ORG="${{ inputs.target-org }}"
+        TGT_REPO="${{ inputs.target-repo }}"
+        SRC_TOKEN="${{ inputs.source-token }}"
+        TGT_TOKEN="${{ inputs.target-token }}"
+
+        echo "🛡️ Migrating branch protection rules from ${SRC_ORG}/${SRC_REPO} → ${TGT_ORG}/${TGT_REPO}..."
+
+        MANUAL_ITEMS_FILE=$(mktemp)
+        MIGRATED_COUNT=0
+        SKIPPED_COUNT=0
+
+        # Strategy: List ALL branches, then check each for protection rules.
+        # We cannot rely on ?protected=true because it only returns branches where
+        # protection is actually enforced — on free GitHub orgs, protection rules
+        # exist but are "Not enforced", so ?protected=true returns an empty array.
+
+        # First, try the ?protected=true approach
+        BRANCHES=$(curl -s \
+          -H "Authorization: Bearer $SRC_TOKEN" \
+          -H "Accept: application/vnd.github+json" \
+          "https://api.github.com/repos/${SRC_ORG}/${SRC_REPO}/branches?protected=true&per_page=100")
+
+        # Debug: detect API error responses
+        if echo "$BRANCHES" | jq -e '.message' > /dev/null 2>&1; then
+          echo "   ❌ API error listing protected branches: $(echo "$BRANCHES" | jq -r '.message')"
+          echo "   Full response: $BRANCHES"
+          echo "   💡 Ensure GH_SOURCE_PAT has 'repo' scope (classic) or 'administration:read' permission (fine-grained)"
+        fi
+
+        BRANCH_COUNT=$(echo "$BRANCHES" | jq 'if type == "array" then length else 0 end')
+        echo "   Found $BRANCH_COUNT branch(es) via ?protected=true filter"
+
+        # Fallback: If no protected branches found, list ALL branches and probe each
+        # for protection rules. This handles free-plan orgs where rules exist but
+        # are "Not enforced" (the API doesn't consider them as protected=true).
+        if [ "$BRANCH_COUNT" -eq 0 ]; then
+          echo "   🔄 Fallback: listing all branches and probing each for protection rules..."
+          ALL_BRANCHES=$(curl -s \
+            -H "Authorization: Bearer $SRC_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${SRC_ORG}/${SRC_REPO}/branches?per_page=100")
+
+          if echo "$ALL_BRANCHES" | jq -e '.message' > /dev/null 2>&1; then
+            echo "   ❌ API error listing branches: $(echo "$ALL_BRANCHES" | jq -r '.message')"
+          fi
+
+          ALL_COUNT=$(echo "$ALL_BRANCHES" | jq 'if type == "array" then length else 0 end')
+          echo "   Found $ALL_COUNT total branch(es) in source repo"
+
+          # Probe each branch for protection rules
+          PROTECTED_BRANCHES="[]"
+          if [ "$ALL_COUNT" -gt 0 ]; then
+            ALL_BRANCH_NAMES=$(echo "$ALL_BRANCHES" | jq -r '.[].name')
+            while IFS= read -r PROBE_BRANCH; do
+              PROBE_ENCODED=$(echo -n "$PROBE_BRANCH" | jq -sRr @uri)
+              PROBE_RESP=$(curl -s -o /dev/null -w "%{http_code}" \
+                -H "Authorization: Bearer $SRC_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${SRC_ORG}/${SRC_REPO}/branches/${PROBE_ENCODED}/protection")
+              if [ "$PROBE_RESP" = "200" ]; then
+                echo "   ✅ Branch '$PROBE_BRANCH' has protection rules"
+                PROTECTED_BRANCHES=$(echo "$PROTECTED_BRANCHES" | jq --arg name "$PROBE_BRANCH" '. + [{"name": $name}]')
+              fi
+            done <<< "$ALL_BRANCH_NAMES"
+          fi
+
+          BRANCH_COUNT=$(echo "$PROTECTED_BRANCHES" | jq 'length')
+          echo "   Found $BRANCH_COUNT branch(es) with protection rules (via probe)"
+          BRANCHES="$PROTECTED_BRANCHES"
+        fi
+
+        if [ "$BRANCH_COUNT" -eq 0 ]; then
+          echo "   ℹ️ No branch protection rules to migrate"
+        else
+          BRANCH_LIST=$(echo "$BRANCHES" | jq -r '.[].name')
+          while IFS= read -r BRANCH_NAME; do
+            echo ""
+            echo "   📋 Processing branch: $BRANCH_NAME"
+
+            # URL-encode branch name for API calls (handles branches with / etc.)
+            ENCODED_BRANCH=$(echo -n "$BRANCH_NAME" | jq -sRr @uri)
+
+            # Get full protection details from source
+            PROTECTION=$(curl -s \
+              -H "Authorization: Bearer $SRC_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${SRC_ORG}/${SRC_REPO}/branches/${ENCODED_BRANCH}/protection")
+
+            # Check if protection response is valid
+            if echo "$PROTECTION" | jq -e '.message' > /dev/null 2>&1; then
+              echo "   ⚠️ Could not read protection for '$BRANCH_NAME': $(echo "$PROTECTION" | jq -r '.message')"
+              SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+              continue
+            fi
+
+            # --- Extract MIGRATABLE settings ---
+
+            # required_status_checks (strict mode + context/check names)
+            # NOTE: Use only 'checks' (not deprecated 'contexts'), and reset app_id to -1
+            # because source app_ids don't exist on target and cause 422 errors
+            STATUS_CHECKS=$(echo "$PROTECTION" | jq '
+              if .required_status_checks then
+                {
+                  strict: .required_status_checks.strict,
+                  contexts: [],
+                  checks: [(.required_status_checks.checks // [] | .[] | {context: .context, app_id: -1})]
+                }
+              else null end
+            ')
+
+            # enforce_admins
+            ENFORCE_ADMINS=$(echo "$PROTECTION" | jq '.enforce_admins.enabled // false')
+
+            # required_pull_request_reviews (migratable fields only)
+            # SKIPPED: dismissal_restrictions, bypass_pull_request_allowances (actor-specific)
+            PR_REVIEWS=$(echo "$PROTECTION" | jq '
+              if .required_pull_request_reviews then
+                {
+                  dismiss_stale_reviews: (.required_pull_request_reviews.dismiss_stale_reviews // false),
+                  require_code_owner_reviews: (.required_pull_request_reviews.require_code_owner_reviews // false),
+                  required_approving_review_count: (.required_pull_request_reviews.required_approving_review_count // 1),
+                  require_last_push_approval: (.required_pull_request_reviews.require_last_push_approval // false)
+                }
+              else null end
+            ')
+
+            # Boolean protection settings
+            REQUIRED_LINEAR=$(echo "$PROTECTION" | jq '.required_linear_history.enabled // false')
+            ALLOW_FORCE_PUSH=$(echo "$PROTECTION" | jq '.allow_force_pushes.enabled // false')
+            ALLOW_DELETIONS=$(echo "$PROTECTION" | jq '.allow_deletions.enabled // false')
+            BLOCK_CREATIONS=$(echo "$PROTECTION" | jq '.block_creations.enabled // false')
+            REQUIRED_CONVERSATION=$(echo "$PROTECTION" | jq '.required_conversation_resolution.enabled // false')
+            ALLOW_FORK_SYNC=$(echo "$PROTECTION" | jq '.allow_fork_syncing.enabled // false')
+
+            # Required signatures (needs separate API call to enable)
+            REQ_SIGNATURES=$(echo "$PROTECTION" | jq '.required_signatures.enabled // false')
+
+            # --- Log NON-MIGRATABLE settings (actor-specific / unsupported) ---
+
+            # Push restrictions (specific users/teams/apps)
+            HAS_RESTRICTIONS=$(echo "$PROTECTION" | jq '
+              .restrictions != null and
+              ((.restrictions.users // [] | length > 0) or (.restrictions.teams // [] | length > 0) or (.restrictions.apps // [] | length > 0))
+            ')
+            if [ "$HAS_RESTRICTIONS" = "true" ]; then
+              echo "   ⚠️ Push restrictions (specific users/teams/apps) — SKIPPED (actor-specific)"
+              echo "- Branch \`${BRANCH_NAME}\`: Push restrictions (users/teams/apps)" >> "$MANUAL_ITEMS_FILE"
+            fi
+
+            # PR review dismissal restrictions
+            HAS_DISMISS=$(echo "$PROTECTION" | jq '
+              .required_pull_request_reviews.dismissal_restrictions != null and
+              ((.required_pull_request_reviews.dismissal_restrictions.users // [] | length > 0) or
+               (.required_pull_request_reviews.dismissal_restrictions.teams // [] | length > 0))
+            ')
+            if [ "$HAS_DISMISS" = "true" ]; then
+              echo "   ⚠️ PR dismissal restrictions — SKIPPED (actor-specific)"
+              echo "- Branch \`${BRANCH_NAME}\`: PR review dismissal restrictions" >> "$MANUAL_ITEMS_FILE"
+            fi
+
+            # PR bypass allowances
+            HAS_BYPASS=$(echo "$PROTECTION" | jq '
+              .required_pull_request_reviews.bypass_pull_request_allowances != null and
+              ((.required_pull_request_reviews.bypass_pull_request_allowances.users // [] | length > 0) or
+               (.required_pull_request_reviews.bypass_pull_request_allowances.teams // [] | length > 0))
+            ')
+            if [ "$HAS_BYPASS" = "true" ]; then
+              echo "   ⚠️ PR bypass allowances — SKIPPED (actor-specific)"
+              echo "- Branch \`${BRANCH_NAME}\`: PR bypass allowances (users/teams)" >> "$MANUAL_ITEMS_FILE"
+            fi
+
+            # Lock branch
+            LOCK_BRANCH=$(echo "$PROTECTION" | jq '.lock_branch.enabled // false')
+            if [ "$LOCK_BRANCH" = "true" ]; then
+              echo "   ⚠️ Lock branch — SKIPPED (not migratable)"
+              echo "- Branch \`${BRANCH_NAME}\`: Lock branch setting" >> "$MANUAL_ITEMS_FILE"
+            fi
+
+            # Required deployments
+            HAS_DEPLOYMENTS=$(echo "$PROTECTION" | jq '
+              .required_deployments != null and (.required_deployments.enforcement_level // "off") != "off"
+            ')
+            if [ "$HAS_DEPLOYMENTS" = "true" ]; then
+              echo "   ⚠️ Required deployments — SKIPPED"
+              echo "- Branch \`${BRANCH_NAME}\`: Required deployments to succeed" >> "$MANUAL_ITEMS_FILE"
+            fi
+
+            # --- Build PUT payload with migratable settings only ---
+            PAYLOAD=$(jq -n \
+              --argjson status_checks "$STATUS_CHECKS" \
+              --argjson enforce_admins "$ENFORCE_ADMINS" \
+              --argjson pr_reviews "$PR_REVIEWS" \
+              --argjson required_linear "$REQUIRED_LINEAR" \
+              --argjson allow_force "$ALLOW_FORCE_PUSH" \
+              --argjson allow_del "$ALLOW_DELETIONS" \
+              --argjson block_create "$BLOCK_CREATIONS" \
+              --argjson req_conversation "$REQUIRED_CONVERSATION" \
+              --argjson allow_fork "$ALLOW_FORK_SYNC" \
+              '{
+                required_status_checks: $status_checks,
+                enforce_admins: $enforce_admins,
+                required_pull_request_reviews: $pr_reviews,
+                restrictions: null,
+                required_linear_history: $required_linear,
+                allow_force_pushes: $allow_force,
+                allow_deletions: $allow_del,
+                block_creations: $block_create,
+                required_conversation_resolution: $req_conversation,
+                allow_fork_syncing: $allow_fork
+              }')
+
+            # --- Debug: log the payload being sent ---
+            echo "   📦 Payload for '$BRANCH_NAME':"
+            echo "$PAYLOAD" | jq . 2>/dev/null || echo "$PAYLOAD"
+
+            # --- Apply branch protection to target ---
+            HTTP_CODE=$(curl -s -o /tmp/bp_response.json -w "%{http_code}" \
+              -X PUT \
+              -H "Authorization: Bearer $TGT_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -H "Content-Type: application/json" \
+              -d "$PAYLOAD" \
+              "https://api.github.com/repos/${TGT_ORG}/${TGT_REPO}/branches/${ENCODED_BRANCH}/protection")
+
+            if [ "$HTTP_CODE" = "200" ]; then
+              MIGRATED_COUNT=$((MIGRATED_COUNT + 1))
+              echo "   ✅ Branch protection migrated for '$BRANCH_NAME'"
+              # Log what was migrated
+              [ "$STATUS_CHECKS" != "null" ] && echo "      • Required status checks: migrated"
+              [ "$ENFORCE_ADMINS" = "true" ] && echo "      • Enforce admins: enabled"
+              [ "$PR_REVIEWS" != "null" ] && echo "      • Required PR reviews: migrated"
+              [ "$REQUIRED_LINEAR" = "true" ] && echo "      • Required linear history: enabled"
+              [ "$REQUIRED_CONVERSATION" = "true" ] && echo "      • Required conversation resolution: enabled"
+              [ "$ALLOW_FORCE_PUSH" = "true" ] && echo "      • Allow force pushes: enabled (simple mode)"
+              [ "$ALLOW_DELETIONS" = "true" ] && echo "      • Allow deletions: enabled"
+              [ "$BLOCK_CREATIONS" = "true" ] && echo "      • Block creations: enabled"
+            else
+              ERROR_MSG=$(cat /tmp/bp_response.json | jq -r '.message // "Unknown error"')
+              ERROR_DETAIL=$(cat /tmp/bp_response.json | jq -r '.errors // [] | .[] | .message // .code // empty' 2>/dev/null)
+              echo "   ⚠️ Branch protection for '$BRANCH_NAME' — HTTP $HTTP_CODE — $ERROR_MSG"
+              [ -n "$ERROR_DETAIL" ] && echo "   📋 Details: $ERROR_DETAIL"
+              echo "   📋 Full response: $(cat /tmp/bp_response.json)"
+              SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+            fi
+
+            # --- Enable required signatures if source had it (separate API endpoint) ---
+            if [ "$REQ_SIGNATURES" = "true" ]; then
+              SIG_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+                -X POST \
+                -H "Authorization: Bearer $TGT_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${TGT_ORG}/${TGT_REPO}/branches/${ENCODED_BRANCH}/protection/required_signatures")
+              if [ "$SIG_CODE" = "200" ]; then
+                echo "   ✅ Required signatures enabled for '$BRANCH_NAME'"
+              else
+                echo "   ⚠️ Required signatures for '$BRANCH_NAME' — HTTP $SIG_CODE"
+              fi
+            fi
+
+          done <<< "$BRANCH_LIST"
+        fi
+
+        echo ""
+        echo "   Summary: $MIGRATED_COUNT branch(es) migrated, $SKIPPED_COUNT skipped"
+
+        # Store manual items for issue comment reporting
+        MANUAL_ITEMS=""
+        if [ -s "$MANUAL_ITEMS_FILE" ]; then
+          echo ""
+          echo "   ⚠️ The following branch protection settings require manual re-configuration:"
+          cat "$MANUAL_ITEMS_FILE"
+          MANUAL_ITEMS=$(cat "$MANUAL_ITEMS_FILE")
+          {
+            echo "BRANCH_PROTECTION_MANUAL<<EOF"
+            cat "$MANUAL_ITEMS_FILE"
+            echo "EOF"
+          } >> "$GITHUB_ENV"
+        else
+          echo "   ✅ All branch protection rules fully migrated — no manual action needed"
+          echo "BRANCH_PROTECTION_MANUAL=" >> "$GITHUB_ENV"
+        fi
+
+        # Set outputs
+        echo "migrated_count=$MIGRATED_COUNT" >> $GITHUB_OUTPUT
+        echo "branch_count=$BRANCH_COUNT" >> $GITHUB_OUTPUT
+
+        # Use delimiter for multiline output
+        {
+          echo "manual_items<<EOF"
+          echo "$MANUAL_ITEMS"
+          echo "EOF"
+        } >> $GITHUB_OUTPUT
+
+        rm -f "$MANUAL_ITEMS_FILE"
