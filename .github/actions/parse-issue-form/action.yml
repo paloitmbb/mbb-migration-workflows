@@ -1,0 +1,134 @@
+name: "Parse Issue Form"
+description: "Parse GitHub issue form body and extract field values by label. Supports single-line fields, textarea fields, and checkbox fields."
+
+inputs:
+  issue-body:
+    description: "The raw issue body text to parse"
+    required: true
+  field-mapping:
+    description: |
+      JSON object mapping output keys to issue form labels.
+      Keys become output names (prefixed with issueparser_).
+      Example: { "source_org": "Source Organization" }
+    required: true
+  textarea-fields:
+    description: |
+      JSON array of field keys (from field-mapping) that should be parsed as textarea (multi-line) fields.
+      Example: ["team_mappings", "justification"]
+    required: false
+    default: "[]"
+  checkbox-fields:
+    description: |
+      JSON array of field keys (from field-mapping) that should be parsed as checkbox fields.
+      Checked items are returned as a comma-separated string.
+      Example: ["migration_options"]
+    required: false
+    default: "[]"
+  fallback-values:
+    description: |
+      JSON object mapping field keys to fallback/default values when the parsed value is empty.
+      Example: { "default_branch": "main" }
+    required: false
+    default: "{}"
+
+outputs:
+  issueparser_source_organization:
+    description: "Parsed source organization"
+    value: ${{ steps.parse.outputs.issueparser_source_organization }}
+  issueparser_source_repo:
+    description: "Parsed source repository name"
+    value: ${{ steps.parse.outputs.issueparser_source_repo }}
+  issueparser_target_organization:
+    description: "Parsed target organization"
+    value: ${{ steps.parse.outputs.issueparser_target_organization }}
+  issueparser_target_repo:
+    description: "Parsed target repository name"
+    value: ${{ steps.parse.outputs.issueparser_target_repo }}
+  issueparser_target_visibility:
+    description: "Parsed target visibility"
+    value: ${{ steps.parse.outputs.issueparser_target_visibility }}
+  issueparser_migration_options:
+    description: "Parsed migration options (comma-separated)"
+    value: ${{ steps.parse.outputs.issueparser_migration_options }}
+  issueparser_admins:
+    description: "Parsed admin users"
+    value: ${{ steps.parse.outputs.issueparser_admins }}
+  issueparser_team_mappings:
+    description: "Parsed team access mappings"
+    value: ${{ steps.parse.outputs.issueparser_team_mappings }}
+  issueparser_justification:
+    description: "Parsed justification"
+    value: ${{ steps.parse.outputs.issueparser_justification }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Parse issue form fields
+      id: parse
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const issueBody = `${{ inputs.issue-body }}`;
+          const fieldMapping = JSON.parse(`${{ inputs.field-mapping }}`);
+          const textareaFields = JSON.parse(`${{ inputs.textarea-fields }}`);
+          const checkboxFields = JSON.parse(`${{ inputs.checkbox-fields }}`);
+          const fallbackValues = JSON.parse(`${{ inputs.fallback-values }}`);
+
+          // Helper: extract single-line field value
+          function extractField(body, fieldLabel) {
+            const regex = new RegExp(`### ${fieldLabel}\\s*\\n\\s*([^\\n#]+)`, 'i');
+            const match = body.match(regex);
+            return match ? match[1].trim() : '';
+          }
+
+          // Helper: extract textarea (multi-line) field value
+          function extractTextarea(body, fieldLabel) {
+            const regex = new RegExp(`### ${fieldLabel}\\s*\\n\\s*([\\s\\S]*?)(?=\\n###|$)`, 'i');
+            const match = body.match(regex);
+            return match ? match[1].trim() : '';
+          }
+
+          // Helper: extract checked checkbox items
+          function extractCheckboxes(body, fieldLabel) {
+            const regex = new RegExp(`### ${fieldLabel}[\\s\\S]*?(?=\\n###|$)`, 'i');
+            const section = body.match(regex);
+            if (!section) return [];
+
+            const checkedItems = [];
+            const lines = section[0].split('\n');
+            for (const line of lines) {
+              if (line.includes('- [X]') || line.includes('- [x]')) {
+                const label = line.replace(/- \[x\]/i, '').trim();
+                checkedItems.push(label);
+              }
+            }
+            return checkedItems;
+          }
+
+          // Parse each mapped field
+          const results = {};
+          for (const [key, label] of Object.entries(fieldMapping)) {
+            let value;
+            if (checkboxFields.includes(key)) {
+              const items = extractCheckboxes(issueBody, label);
+              value = items.join(', ');
+            } else if (textareaFields.includes(key)) {
+              value = extractTextarea(issueBody, label);
+            } else {
+              value = extractField(issueBody, label);
+            }
+
+            // Apply fallback if value is empty
+            if (!value && fallbackValues[key]) {
+              value = fallbackValues[key];
+            }
+
+            results[key] = value;
+            core.setOutput(`issueparser_${key}`, value);
+          }
+
+          // Log parsed values
+          core.info('Parsed Issue Form Fields:');
+          for (const [key, value] of Object.entries(results)) {
+            core.info(`  ${key}: ${value || '(empty)'}`);
+          }
