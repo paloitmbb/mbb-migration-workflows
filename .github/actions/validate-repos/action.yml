@@ -1,0 +1,120 @@
+name: "Validate Repositories"
+description: "Validate that the source repository exists (and is not archived), the target organization/user exists, and the target repository name is available."
+
+inputs:
+  source-org:
+    description: "Source organization name"
+    required: true
+  source-repo:
+    description: "Source repository name"
+    required: true
+  target-org:
+    description: "Target organization or user name"
+    required: true
+  target-repo:
+    description: "Target repository name"
+    required: true
+  issue-number:
+    description: "Issue number to comment errors on"
+    required: true
+  source-token:
+    description: "PAT with read access to the source repository"
+    required: true
+  target-token:
+    description: "PAT with access to the target organization"
+    required: true
+  github-token:
+    description: "GITHUB_TOKEN for commenting on issues"
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    - name: Validate source and target repositories
+      shell: bash
+      run: |
+        SRC_ORG="${{ inputs.source-org }}"
+        SRC_REPO="${{ inputs.source-repo }}"
+        TGT_ORG="${{ inputs.target-org }}"
+        TGT_REPO="${{ inputs.target-repo }}"
+        ISSUE_NUM="${{ inputs.issue-number }}"
+
+        ERRORS=""
+
+        # ── 1. Validate source repository exists ──
+        echo "🔍 Checking source: ${SRC_ORG}/${SRC_REPO} on GitHub..."
+
+        HTTP_CODE=$(curl -s -o /tmp/src_repo.json -w "%{http_code}" \
+          -H "Authorization: Bearer ${{ inputs.source-token }}" \
+          -H "Accept: application/vnd.github+json" \
+          "https://api.github.com/repos/${SRC_ORG}/${SRC_REPO}")
+
+        if [ "$HTTP_CODE" != "200" ]; then
+          ERRORS="${ERRORS}\n- ❌ **Source repo** \`${SRC_ORG}/${SRC_REPO}\` not found on GitHub (HTTP ${HTTP_CODE}). Verify the repository name and that \`GH_SOURCE_PAT\` has read access."
+        else
+          ARCHIVED=$(jq -r '.archived' /tmp/src_repo.json)
+          if [ "$ARCHIVED" = "true" ]; then
+            ERRORS="${ERRORS}\n- ❌ **Source repo** \`${SRC_ORG}/${SRC_REPO}\` is **archived**. Cannot migrate an archived repository."
+          else
+            SIZE=$(jq -r '.size' /tmp/src_repo.json)
+            BRANCH=$(jq -r '.default_branch' /tmp/src_repo.json)
+            VISIBILITY=$(jq -r '.visibility' /tmp/src_repo.json)
+            echo "   ✅ Source repository verified (size: ${SIZE} KB, branch: ${BRANCH}, visibility: ${VISIBILITY})"
+          fi
+        fi
+
+        # ── 2. Validate target organization/user exists ──
+        echo "🔍 Checking target org: ${TGT_ORG} on GitHub.com..."
+
+        HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+          -H "Authorization: Bearer ${{ inputs.target-token }}" \
+          -H "Accept: application/vnd.github+json" \
+          "https://api.github.com/orgs/${TGT_ORG}")
+
+        # Check if it's a user instead of an org
+        if [ "$HTTP_CODE" != "200" ]; then
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer ${{ inputs.target-token }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/users/${TGT_ORG}")
+        fi
+
+        if [ "$HTTP_CODE" != "200" ]; then
+          ERRORS="${ERRORS}\n- ❌ **Target org/user** \`${TGT_ORG}\` not found on GitHub.com (HTTP ${HTTP_CODE}). Ensure the target organization or user exists."
+        else
+          echo "   ✅ Target organization/user '${TGT_ORG}' verified"
+        fi
+
+        # ── 3. Check target repo name is not already taken ──
+        echo "🔍 Checking target repo: ${TGT_ORG}/${TGT_REPO}..."
+
+        HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+          -H "Authorization: Bearer ${{ inputs.target-token }}" \
+          -H "Accept: application/vnd.github+json" \
+          "https://api.github.com/repos/${TGT_ORG}/${TGT_REPO}")
+
+        if [ "$HTTP_CODE" = "200" ]; then
+          ERRORS="${ERRORS}\n- ❌ **Target repo** \`${TGT_ORG}/${TGT_REPO}\` **already exists** on GitHub.com. Choose a different name or delete the existing repository first."
+        elif [ "$HTTP_CODE" = "404" ]; then
+          echo "   ✅ Target repository name '${TGT_ORG}/${TGT_REPO}' is available — GEI will create it during migration"
+        else
+          ERRORS="${ERRORS}\n- ❌ **Target repo** \`${TGT_ORG}/${TGT_REPO}\` could not be verified (HTTP ${HTTP_CODE}). Ensure \`GH_TARGET_PAT\` has access to the target organization."
+        fi
+
+        # ── Report any errors ──
+        if [ -n "$ERRORS" ]; then
+          echo "::error::Repository validation failed"
+          gh issue comment "$ISSUE_NUM" \
+            --body "❌ **Repository Validation Failed**
+
+        The following checks did not pass:
+        $(echo -e "$ERRORS")
+
+        Please close this issue, fix the errors above, and submit a new request."
+          exit 1
+        fi
+
+        echo ""
+        echo "✅ All repository validations passed"
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
