@@ -9,7 +9,11 @@ This document describes the implementation plan for the **GitHub Enterprise Serv
 | Component | Path | Purpose |
 |-----------|------|---------|
 | Issue Template | `.github/ISSUE_TEMPLATE/ghec-migration-request.yml` | Self-service form for users to request a repository migration |
-| Workflow | `.github/workflows/issue-ghec-migration.yml` | 7-job pipeline that validates, migrates, configures, verifies, and closes the request |
+| Workflow | `.github/workflows/issue-ghec-migration.yml` | 7-job pipeline that validates, migrates, configures, and closes the request |
+| Parse Issue Form Action | `.github/actions/parse-issue-form/action.yml` | Composite action to parse GitHub issue form bodies and extract field values |
+| Validate Repos Action | `.github/actions/validate-repos/action.yml` | Composite action to validate source/target repository existence and availability |
+| GitHub Stats Action | `.github/actions/gh-stats/action.yml` | Composite action to gather comprehensive repository statistics (19 metrics) |
+| Migrate Branch Protections Action | `.github/actions/migrate-branch-protections/action.yml` | Composite action to migrate branch protection rules between repositories |
 
 ---
 
@@ -19,12 +23,11 @@ Before the solution can be used, the following must be in place:
 
 | # | Prerequisite | Details |
 |---|-------------|---------|
-| 1 | **GH_SOURCE_PAT** secret | A Personal Access Token with **read** access to the source GHES instance (repo, org scopes) |
-| 2 | **GH_TARGET_PAT** secret | A Personal Access Token with **write/admin** access to the target GHEC organization (repo, admin:org, workflow scopes) |
-| 3 | **GHES version ≥ 3.8** | Required for direct migration without intermediate blob storage |
-| 4 | **Target org exists on GHEC** | The target GitHub.com organization must already be created |
-| 5 | **Network connectivity** | GitHub Actions runners must be able to reach the GHES instance URL |
-| 6 | **`migration-approval` environment** | A GitHub environment with required reviewers configured for the approval gate |
+| 1 | **GH_SOURCE_PAT** secret | A Personal Access Token with **read** access to the source GitHub.com organization (repo, admin:org scopes) |
+| 2 | **GH_TARGET_PAT** secret | A Personal Access Token with **write/admin** access to the target GitHub.com organization (repo, admin:org, workflow scopes) |
+| 3 | **Source org exists on GitHub.com** | The source GitHub.com organization must be accessible |
+| 4 | **Target org exists on GitHub.com** | The target GitHub.com organization must already be created |
+| 5 | **`migration-approval` environment** | A GitHub environment with required reviewers configured for the approval gate |
 
 ---
 
@@ -36,17 +39,17 @@ The issue template collects all information needed to execute a migration:
 
 | Section | Field | Type | Required | Validation |
 |---------|-------|------|----------|------------|
-| **Source (GHES)** | Source GHES URL | `input` | Yes | Must be a valid HTTP(S) URL |
+| **Source** | Source GHES URL | `input` | Yes | Placeholder URL (currently unused by workflow) |
 | | Source Organization | `input` | Yes | — |
 | | Source Repository Name | `input` | Yes | — |
 | **Target (GHEC)** | Target Organization | `input` | Yes | Must exist on GitHub.com |
-| | Target Repository Name | `input` | Yes | Regex: `^[a-z0-9]+(-[a-z0-9]+)+$` |
+| | Target Repository Name | `input` | Yes | Must follow naming convention (lowercase, hyphens) |
 | | Target Visibility | `dropdown` | Yes | `private` (default), `internal`, `public` |
-| **Migration Options** | Checkboxes | `checkboxes` | No | 5 options (commit history, PRs, issues, releases, archive source) |
+| **Migration Options** | Checkboxes | `checkboxes` | No | 1 option: Archive source repository after successful migration |
 | **Access** | Admins | `input` | Yes | Comma-separated GitHub usernames |
 | | Team Access Mappings | `textarea` | No | Format: `source-team → target-team : permission` |
 | **Other** | Justification | `textarea` | Yes | Free-text reason for migration |
-| | Confirmation | `checkboxes` | Yes | 3 mandatory confirmations |
+| | Confirmation | `checkboxes` | Yes | 4 mandatory confirmations |
 
 ### 3.2 Naming Convention
 
@@ -86,59 +89,103 @@ The workflow triggers when an issue is opened and filters by title prefix `[GHEC
 The workflow consists of **7 sequential jobs** with dependency gates:
 
 ```
-┌──────────┐    ┌──────────┐    ┌───────────────┐    ┌─────────┐
-│ validate │───►│ approval │───►│ pre-migration │───►│ migrate │
-└──────────┘    └──────────┘    └───────────────┘    └────┬────┘
+┌──────────┐    ┌───────────────┐    ┌──────────┐    ┌─────────┐
+│ validate │───►│ pre-migration │───►│ approval │───►│ migrate │
+└──────────┘    └───────────────┘    └──────────┘    └────┬────┘
                                                           │
                                                           ▼
-                                ┌─────────────┐    ┌──────────────────┐
-                                │   verify     │◄───│ post-migration   │
-                                └──────┬──────┘    └──────────────────┘
-                                       │
-                                       ▼
-                                ┌──────────┐    ┌─────────────┐
-                                │ cutover  │───►│ close-issue │
-                                └──────────┘    └─────────────┘
+                ┌─────────────┐    ┌──────────────────┐   │
+                │ close-issue │◄───│    cutover        │◄──┘
+                └─────────────┘    └──────┬───────────┘
+                                          │
+                                   ┌──────┴───────────┐
+                                   │ post-migration    │
+                                   └──────────────────┘
 ```
+
+**Job dependency chain:**
+- `validate` → independent (first job)
+- `pre-migration` → needs `validate`
+- `approval` → needs `validate`, `pre-migration`
+- `migrate` → needs `validate`, `approval`
+- `post-migration` → needs `validate`, `pre-migration`, `migrate`
+- `cutover` → needs `validate`, `pre-migration`, `post-migration`
+- `close-issue` → needs `validate`, `pre-migration`, `cutover`, `post-migration`
 
 ---
 
 ### 4.3 Job 1: Validate (`validate`)
 
-**Purpose:** Parse the issue body, extract all fields, and validate them against the source GHES and target GHEC.
+**Purpose:** Parse the issue body, extract all fields, and validate the source and target repositories.
 
 | # | Step | Description | Implementation Detail |
 |---|------|-------------|----------------------|
 | 1 | Checkout | Clone the repository | `actions/checkout@v4` |
-| 2 | Parse Issue Form | Extract fields from issue body using regex | `actions/github-script@v7` with custom JS parsing functions (`extractField`, `extractTextarea`, `extractCheckboxes`) |
-| 3 | Display parsed values | Log all parsed values for debugging | Shell `echo` statements |
-| 4 | Validate required fields | Check all mandatory fields are non-empty; validate GHES URL format (`^https?://`); validate target repo naming convention | Shell script with error accumulation |
-| 5 | Validate GHES reachable | `GET {ghes_url}/api/v3/meta` with `GH_SOURCE_PAT` | `curl` with 15s timeout; HTTP 200 = pass, 000 = fail, other = warn |
-| 6 | Validate source repo exists | `GET {ghes_api}/repos/{org}/{repo}` | Also checks if repo is archived (blocks migration) |
-| 7 | Validate target org exists | `GET https://api.github.com/orgs/{org}` (falls back to `/users/{org}`) | Uses `GH_TARGET_PAT` |
-| 8 | Check target repo name available | `GET https://api.github.com/repos/{org}/{repo}` | HTTP 200 means name is taken → fail |
-| 9 | Post validation results | Post detailed comment to issue | `actions/github-script@v7` — adds labels (`validation-passed` or `validation-failed`) |
-| 10 | Comment validation passed | Summary table posted to issue | `peter-evans/create-or-update-comment@v4` |
-| 11 | Generate validation summary | Write GitHub Actions job summary | `core.summary.addRaw().write()` |
-| 12 | Label as in-progress | Add `in-progress` label to issue | `gh issue edit --add-label` |
+| 2 | Parse Issue Form | Extract fields from issue body using regex-based composite action | `./.github/actions/parse-issue-form` — parses single-line fields, textarea fields (`team_mappings`, `justification`), and checkbox fields (`migration_options`) via configurable `field-mapping` JSON |
+| 3 | Validate source and target repositories | Check source repo exists/not archived, target org exists, target repo name available | `./.github/actions/validate-repos` — posts error comments on issue if validation fails |
+| 4 | Label as in-progress | Create (if needed) and apply `in-progress` label to issue | `gh label create` + `gh issue edit --add-label` |
 
 **Outputs propagated to downstream jobs:**
 
 - `source_organization`, `source_repo`, `target_organization`, `target_repo`
 - `target_visibility`, `migration_options`, `admins`, `team_mappings`, `justification`
-- `ghes_url`, `source_api_url`, `issue_number`
+- `issue_number`
 
 ---
 
-### 4.4 Job 2: Approval Gate (`approval`)
+### 4.4 Job 2: Pre-Migration Setup (`pre-migration`)
+
+**Purpose:** Record the source repository's current state for post-migration reporting and verification.
+
+| # | Step | Description | Implementation Detail |
+|---|------|-------------|----------------------|
+| 1 | Checkout | Clone the repository | `actions/checkout@v4` |
+| 2 | Parse migration options | Extract `archive_source` flag from checkboxes | String match on `"Archive source repository"` |
+| 3 | Gather source repository stats | Capture 19 comprehensive repository metrics | `./.github/actions/gh-stats` composite action with paginated API calls |
+| 4 | Post pre-migration summary | Post detailed metrics table and migration details to issue; add labels | `actions/github-script@v7` — builds issue comment + workflow job summary |
+
+**Outputs (19 metrics + options):**
+
+| Output | Description |
+|--------|-------------|
+| `source_branches` | Total branch count |
+| `source_tags` | Total tag count |
+| `source_head_sha` | HEAD commit SHA of default branch |
+| `source_default_branch` | Default branch name |
+| `source_protected_branches` | Number of protected branches |
+| `source_pr_count` | Total PR count (all states) |
+| `source_issue_count` | Total issue count (all states) |
+| `source_release_count` | Total releases |
+| `source_repo_size` | Human-readable repo size |
+| `source_is_archived` | Whether repo is archived |
+| `source_last_push` | Last push timestamp |
+| `source_last_update` | Last update timestamp |
+| `source_pr_review_count` | PRs with at least one review |
+| `source_created` | Creation timestamp |
+| `source_has_codeowners` | Whether CODEOWNERS file exists |
+| `archive_source` | Whether to archive source post-migration |
+
+**Pre-migration summary comment includes:**
+- Migration details (source/target repo, visibility, admins)
+- Full source repository stats table (19 metrics)
+- CODEOWNERS alert if not present
+- Migration options, team mappings, justification
+- Labels added: `validation-passed`, `ghec-migration-request`
+
+---
+
+### 4.5 Job 3: Approval Gate (`approval`)
 
 **Purpose:** Pause the workflow and require manual approval before proceeding with the migration.
 
 | # | Step | Description |
 |---|------|-------------|
-| 1 | Comment approval requested | Post comment with migration summary asking for review |
+| 1 | Comment approval requested | Post comment with migration summary table asking for review |
 | 2 | Wait for approval | GitHub environment protection rule (`migration-approval`) blocks until a reviewer approves |
-| 3 | Comment approval granted | Post confirmation comment |
+| 3 | Approval granted | Log confirmation |
+| 4 | Comment approval granted | Post confirmation comment to issue |
+
+**Dependencies:** Needs both `validate` and `pre-migration` to succeed.
 
 **Implementation Requirements:**
 
@@ -148,37 +195,19 @@ The workflow consists of **7 sequential jobs** with dependency gates:
 
 ---
 
-### 4.5 Job 3: Pre-Migration Setup (`pre-migration`)
-
-**Purpose:** Record the source repository's current state for post-migration verification.
-
-| # | Step | Description | API Endpoint (GHES) |
-|---|------|-------------|---------------------|
-| 1 | Parse migration options | Extract `archive_source` flag from checkboxes | String match on `"Archive source repository"` |
-| 2 | Record source state | Capture branch count, tag count, HEAD SHA, default branch | `GET /repos/{org}/{repo}`, `/branches`, `/tags`, `/branches/{default}` |
-| 3 | Comment pre-migration state | Post metrics table to issue | `peter-evans/create-or-update-comment@v4` |
-
-**Outputs:**
-
-- `source_branches`, `source_tags`, `source_head_sha`, `source_default_branch`, `archive_source`
-
----
-
 ### 4.6 Job 4: Execute GEI Migration (`migrate`)
 
-**Purpose:** Run the GitHub Enterprise Importer CLI to migrate the repository.
+**Purpose:** Run the GitHub Enterprise Importer CLI to migrate the repository from source to target on GitHub.com.
 
 | # | Step | Description |
 |---|------|-------------|
 | 1 | Install GEI CLI | `gh extension install github/gh-gei` |
 | 2 | Run GEI migration | Execute `gh gei migrate-repo` with all parameters |
-| 3 | Comment migration result | Post success/failure with GEI output |
 
-**GEI Command:**
+**GEI Command (GitHub.com → GitHub.com):**
 
 ```bash
 gh gei migrate-repo \
-  --ghes-api-url "${GHES_API_URL}" \
   --github-source-org "$SRC_ORG" \
   --source-repo "$SRC_REPO" \
   --github-target-org "$TGT_ORG" \
@@ -198,18 +227,62 @@ gh gei migrate-repo \
 
 ### 4.7 Job 5: Post-Migration Setup (`post-migration`)
 
-**Purpose:** Configure the target repository with proper access, protection rules, and security settings.
+**Purpose:** Configure the target repository with proper access, protection rules, variables, secrets listing, and security settings.
 
 | # | Step | Description | API Used |
 |---|------|-------------|----------|
 | 1 | Wait 15s | Let GitHub.com finalize the import | `sleep 15` |
 | 2 | Add admin collaborators | Iterate comma-separated admin list, add each as admin | `PUT /repos/{org}/{repo}/collaborators/{user}` |
-| 3 | Apply team access mappings | Parse `source → target : permission` format, apply each | `PUT /orgs/{org}/teams/{team}/repos/{org}/{repo}` |
-| 4 | Enable branch protection | Set branch protection on default branch (require PR reviews, dismiss stale reviews, enforce on admins) | `PUT /repos/{org}/{repo}/branches/{branch}/protection` |
-| 5 | Migrate GHAS permissions | Multi-step security migration (see §4.7.1) | Multiple GHES & GHEC API calls |
-| 6 | Comment results | Post summary with GHAS status | `peter-evans/create-or-update-comment@v4` |
+| 3 | Inject CODEOWNERS file | If source has no CODEOWNERS, auto-generate one with admin owners | `PUT /repos/{org}/{repo}/contents/.github/CODEOWNERS` (conditional) |
+| 4 | Apply team access mappings | Parse `source → target : permission` format, apply each | `PUT /orgs/{org}/teams/{team}/repos/{org}/{repo}` |
+| 5 | Migrate branch protection rules | Full migration of all branch protection settings (see §4.7.1) | Multiple `GET/PUT` calls per protected branch |
+| 6 | Migrate variables | Copy repository-level Actions variables from source to target | `GET /repos/{org}/{repo}/actions/variables` → `POST` to target |
+| 7 | List Secret Names | List repo-level, Dependabot, and environment secret names (values not readable) | `GET /repos/{org}/{repo}/actions/secrets`, `/dependabot/secrets`, `/environments/{env}/secrets` |
+| 8 | Migrate GHAS permissions | Multi-step security migration (see §4.7.2) | Multiple GitHub.com API calls |
+| 9 | Comment post-migration setup | Post summary with all migration results and manual action items | `gh issue comment` with env vars |
 
-#### 4.7.1 Advanced Security (GHAS) Migration Sub-steps
+**Outputs:**
+
+| Output | Description |
+|--------|-------------|
+| `secret_names` | Comma-separated secret names by scope (repo-level, Dependabot) |
+| `secret_count` | Total number of secrets found |
+| `secret_error` | Error message if secrets could not be listed |
+
+#### 4.7.1 Branch Protection Migration
+
+The `Migrate branch protection rules` step performs a comprehensive migration:
+
+**Strategy:**
+1. First attempts `?protected=true` filter to list protected branches
+2. Falls back to listing ALL branches and probing each for protection rules (handles free-plan orgs where rules exist but are "Not enforced")
+
+**Settings migrated automatically:**
+
+| Setting | Details |
+|---------|---------|
+| Required status checks | Strict mode + check names (app_id reset to -1 for cross-org compatibility) |
+| Enforce admins | Boolean |
+| Required PR reviews | Dismiss stale reviews, require code owner reviews, approving review count, require last push approval |
+| Required linear history | Boolean |
+| Allow force pushes | Boolean (simple mode) |
+| Allow deletions | Boolean |
+| Block creations | Boolean |
+| Required conversation resolution | Boolean |
+| Allow fork syncing | Boolean |
+| Required signatures | Separate POST endpoint |
+
+**Settings skipped (logged for manual re-configuration):**
+
+| Setting | Reason |
+|---------|--------|
+| Push restrictions (users/teams/apps) | Actor-specific — IDs differ between orgs |
+| PR review dismissal restrictions | Actor-specific |
+| PR bypass allowances | Actor-specific |
+| Lock branch | Not migratable via API |
+| Required deployments | Environment-specific |
+
+#### 4.7.2 Advanced Security (GHAS) Migration Sub-steps
 
 | Sub-step | Action | Source API | Target API |
 |----------|--------|------------|------------|
@@ -224,44 +297,39 @@ gh gei migrate-repo \
 
 ---
 
-### 4.8 Job 6: Verify Migration Integrity (`verify`)
+### 4.8 Job 6: Cutover & Cleanup (`cutover`)
 
-**Purpose:** Compare source and target repository states to confirm migration fidelity.
-
-| Check | Source | Target | Pass Criteria |
-|-------|--------|--------|---------------|
-| Branch count | `pre-migration.source_branches` | `GET /repos/{org}/{repo}/branches` on GHEC | Exact match |
-| Tag count | `pre-migration.source_tags` | `GET /repos/{org}/{repo}/tags` on GHEC | Exact match |
-| HEAD SHA | `pre-migration.source_head_sha` (first 7 chars) | `GET /repos/{org}/{repo}/branches/{default}` on GHEC | First 7 chars match |
-
-**Output:** `verification_passed` = `true` / `false`
-
----
-
-### 4.9 Job 7: Cutover & Cleanup (`cutover`)
-
-**Purpose:** Archive the source repo (if requested) after successful verification.
+**Purpose:** Archive the source repo (if requested) after successful post-migration setup.
 
 | # | Step | Condition | Description |
 |---|------|-----------|-------------|
 | 1 | Checkout | Always | Clone repo for potential manifest updates |
-| 2 | Archive source on GHES | `archive_source == 'true'` | `PATCH {ghes_api}/repos/{org}/{repo}` with `{"archived": true, "description": "[MIGRATED]..."}` |
+| 2 | Archive source on GitHub.com | `archive_source == 'true'` | `PATCH https://api.github.com/repos/{org}/{repo}` with `{"archived": true, "description": "[MIGRATED]..."}` |
 
-**Gate:** Only runs if `verify.verification_passed == 'true'`
+**Gate:** Runs after `validate`, `pre-migration`, and `post-migration` succeed.
 
 ---
 
-### 4.10 Job 8: Close Issue (`close-issue`)
+### 4.9 Job 7: Close Issue (`close-issue`)
 
 **Purpose:** Post a final success comment, generate a workflow summary, and close the issue.
 
 | # | Step | Description |
 |---|------|-------------|
-| 1 | Generate apply summary | Write a detailed job summary with migration details, verification results, and next steps |
-| 2 | Post success comment | Post comprehensive completion comment to issue with migration details table |
+| 1 | Generate apply summary | Write detailed GitHub Actions job summary with migration details, verification results, secrets info, and next steps |
+| 2 | Post success comment | Post comprehensive completion comment to issue with migration details table, verification results, admin access, secrets list, and next steps |
 | 3 | Close issue | Close issue as `completed`, remove `in-progress` label, add `completed` label |
 
-**Gate:** Runs only when `verify.verification_passed == 'true'` AND `cutover` succeeded or was skipped.
+**Gate:** Runs when `cutover` succeeded or was skipped (via `always()` condition). Depends on `validate`, `pre-migration`, `cutover`, and `post-migration`.
+
+**Success comment includes:**
+- Migration details (source/target, visibility, default branch, run link)
+- Verification results table (branches, tags, HEAD SHA)
+- Migration options applied
+- Admin access grants
+- Post-migration actions (archive status, branch protection, manifest)
+- Secrets requiring manual re-creation (with table of names and scopes)
+- Next steps checklist
 
 ---
 
@@ -270,8 +338,8 @@ gh gei migrate-repo \
 | Secret Name | Scope | Required Permissions |
 |-------------|-------|---------------------|
 | `GITHUB_TOKEN` | Auto-provided | `issues: write`, `contents: read` |
-| `GH_SOURCE_PAT` | GHES instance | `repo` (read), `admin:org` (read) on the source GHES |
-| `GH_TARGET_PAT` | GitHub.com (GHEC) | `repo`, `admin:org`, `workflow`, `delete_repo` on the target GHEC org |
+| `GH_SOURCE_PAT` | GitHub.com (source org) | `repo` (read), `admin:org` (read) on the source GitHub.com org |
+| `GH_TARGET_PAT` | GitHub.com (target org) | `repo`, `admin:org`, `workflow`, `delete_repo` on the target GitHub.com org |
 
 ---
 
@@ -301,13 +369,16 @@ The workflow automatically manages the following labels:
 
 | Scenario | Behavior |
 |----------|----------|
-| Missing required fields | Issue comment with specific errors; workflow exits |
-| GHES unreachable | Issue comment with troubleshooting tips; workflow exits |
-| Source repo not found / archived | Issue comment explaining the problem; workflow exits |
-| Target repo name already taken | Issue comment; workflow exits |
-| GEI migration failure | Issue comment with GEI output; workflow exits |
+| Missing required fields | Validation composite action posts error to issue; workflow exits |
+| Source repo not found / archived | Validate-repos action posts error to issue; workflow exits |
+| Target repo name already taken | Validate-repos action posts error to issue; workflow exits |
+| Target org not found | Validate-repos action posts error to issue; workflow exits |
+| GEI migration failure | Migration job fails; GEI output captured via `tee` |
+| Branch protection partial failure | Actor-specific settings logged as manual items; job continues |
 | GHAS migration partial failure | Issue continues; manual steps documented in comment |
-| Verification failure (branch/tag/SHA mismatch) | Cutover is skipped; issue remains open for investigation |
+| CODEOWNERS injection failure | Warning logged; job continues |
+| Team access mapping failure | Warning logged per team; job continues |
+| Secrets listing failure | Error reported in post-migration comment; job continues |
 | Archive source failure | Warning logged; issue still closes successfully |
 
 ---
@@ -317,47 +388,53 @@ The workflow automatically manages the following labels:
 ### Phase 1: Foundation
 
 - [x] Create issue template (`ghec-migration-request.yml`) with all form fields
-- [x] Add input validation (regex for repo naming, required fields)
-- [x] Add confirmation checkboxes for user acknowledgment
+- [x] Add input validation (naming convention, required fields)
+- [x] Add confirmation checkboxes for user acknowledgment (4 confirmations)
 - [x] Document prerequisites in the template header
 
-### Phase 2: Workflow — Validation & Approval
+### Phase 2: Composite Actions
 
-- [x] Implement issue body parsing with `actions/github-script` (Job 1)
-- [x] Implement field-level validation (empty checks, URL format, naming convention)
-- [x] Implement GHES connectivity check (`/meta` endpoint)
-- [x] Implement source repo existence & archived check
-- [x] Implement target org existence check (with user fallback)
-- [x] Implement target repo name availability check
-- [x] Post detailed validation results as issue comment
-- [x] Add `migration-approval` environment gate (Job 2)
+- [x] Implement `parse-issue-form` composite action (regex-based field extraction)
+- [x] Implement `validate-repos` composite action (source exists, not archived, target org exists, name available)
+- [x] Implement `gh-stats` composite action (19 repository metrics with pagination)
+- [x] Implement `migrate-branch-protections` composite action (full protection rule migration with fallback probe)
 
-### Phase 3: Workflow — Migration Execution
+### Phase 3: Workflow — Validation & Pre-Migration
 
-- [x] Implement pre-migration state recording (branches, tags, HEAD SHA) (Job 3)
+- [x] Implement issue body parsing via `parse-issue-form` action (Job 1)
+- [x] Implement repository validation via `validate-repos` action (Job 1)
+- [x] Implement pre-migration state recording with comprehensive stats (Job 2)
+- [x] Post detailed pre-migration summary with stats table to issue (Job 2)
+- [x] Add `migration-approval` environment gate (Job 3)
+
+### Phase 4: Workflow — Migration Execution
+
 - [x] Implement GEI CLI installation and migration execution (Job 4)
-- [x] Capture and post GEI output to issue
+- [x] Capture GEI output via `tee`
 
-### Phase 4: Workflow — Post-Migration & Verification
+### Phase 5: Workflow — Post-Migration Setup
 
 - [x] Implement admin collaborator assignment (Job 5)
+- [x] Implement CODEOWNERS auto-injection when not present in source
 - [x] Implement team access mapping parser and applicator
-- [x] Implement branch protection configuration
-- [x] Implement GHAS permissions migration (6 sub-steps)
-- [x] Implement migration integrity verification (Job 6)
+- [x] Implement comprehensive branch protection migration (with fallback probe and manual item tracking)
+- [x] Implement Actions variables migration (repository-level)
+- [x] Implement secret names listing (repo-level, Dependabot, environment)
+- [x] Implement GHAS permissions migration (6 sub-steps with graceful degradation)
+- [x] Implement post-migration summary comment with all results
 
-### Phase 5: Workflow — Cutover & Closure
+### Phase 6: Workflow — Cutover & Closure
 
-- [x] Implement source repo archival on GHES (Job 7)
-- [x] Implement issue closure with completion summary (Job 8)
-- [x] Implement label lifecycle management
+- [x] Implement source repo archival on GitHub.com (Job 6)
+- [x] Implement workflow job summary generation (Job 7)
+- [x] Implement issue closure with comprehensive completion comment (Job 7)
+- [x] Implement label lifecycle management (`in-progress` → `completed`)
 
-### Phase 6: Operational Readiness
+### Phase 7: Operational Readiness
 
 - [ ] Create `migration-approval` environment with required reviewers
-- [ ] Generate and store `GH_SOURCE_PAT` with correct GHES scopes
-- [ ] Generate and store `GH_TARGET_PAT` with correct GHEC scopes
-- [ ] Verify network connectivity from GitHub Actions runners to GHES
+- [ ] Generate and store `GH_SOURCE_PAT` with correct source org scopes
+- [ ] Generate and store `GH_TARGET_PAT` with correct target org scopes
 - [ ] Run end-to-end test with a non-critical repository
 - [ ] Document runbook for manual intervention scenarios
 - [ ] Establish monitoring/alerting for failed migration workflows
@@ -371,14 +448,18 @@ The workflow automatically manages the following labels:
 | Happy path | Valid source/target, all fields populated | Full migration completes, issue closed with `completed` label |
 | Missing required field | Empty source org | Validation fails, error posted to issue |
 | Invalid repo name | `MyRepo_123` | Validation fails with naming convention error |
-| Source repo archived | Archived GHES repo | Validation fails with "cannot migrate archived repo" |
+| Source repo archived | Archived source repo | Validation fails with "cannot migrate archived repo" |
 | Target repo exists | Pre-existing target repo name | Validation fails with "already exists" |
-| GHES unreachable | Invalid/offline GHES URL | Validation fails with connectivity error |
+| Target org not found | Non-existent target org | Validation fails with org not found error |
 | Approval rejected | Reviewer denies approval | Workflow stops at approval gate |
-| GEI failure | Network issue during migration | Migration job fails, error posted to issue |
+| GEI failure | Network issue during migration | Migration job fails, error captured via tee |
+| No CODEOWNERS in source | Source repo without CODEOWNERS | CODEOWNERS auto-injected in target with admin owners |
+| Branch protection with actor settings | Source has push restrictions | Migratable settings applied, actor-specific logged as manual |
 | Partial GHAS migration | GHAS not licensed on target | GHAS steps report partial, list manual actions |
-| Verification mismatch | Tag count differs | Cutover skipped, issue remains open |
+| Variables migration | Source has Actions variables | Variables copied to target repo |
+| Secrets listing | Source has repo + Dependabot secrets | Secret names listed in post-migration comment |
 | Archive source disabled | Checkbox unchecked | Cutover skips archival, issue still closes |
+| Archive source enabled | Checkbox checked | Source repo archived on GitHub.com |
 
 ---
 
@@ -388,8 +469,10 @@ The workflow automatically manages the following labels:
 2. **Least privilege**: PATs should have the minimum scopes required
 3. **Approval gate**: Prevents unauthorized migrations via the `migration-approval` environment
 4. **No secrets in logs**: All `curl` responses are written to temp files, not echoed directly
-5. **Branch protection**: Automatically applied post-migration to prevent accidental force-pushes
+5. **Branch protection**: Automatically migrated from source to target post-migration
 6. **GHAS parity**: Security settings from source are replicated to target where possible
+7. **CODEOWNERS enforcement**: Auto-injected when missing from source to ensure code review gates
+8. **Secret values not exposed**: Only secret names are listed — values cannot be read via API
 
 ---
 
@@ -397,9 +480,14 @@ The workflow automatically manages the following labels:
 
 | Limitation | Impact | Mitigation |
 |------------|--------|------------|
-| Branch/tag pagination | Repos with >100 branches/tags may show incorrect counts in verification | Use paginated API calls or GitHub CLI |
-| GEI does not migrate GitHub Actions secrets | Secrets must be re-added manually | Document in "Next Steps" comment |
+| Branch/tag pagination | Repos with >100 branches/tags are handled by `gh-stats` pagination | `gh-stats` action uses paginated API calls |
+| GEI does not migrate GitHub Actions secrets | Secrets must be re-added manually | Secret names listed in post-migration comment for reference |
+| GEI does not migrate Actions variables | Variables must be re-created manually | Variables are migrated separately via REST API in post-migration |
+| Actor-specific branch protection settings | Push restrictions, dismissal restrictions, bypass allowances skipped | Logged in issue comment for manual re-configuration |
+| Lock branch setting | Not migratable via branch protection API | Logged in issue comment for manual action |
+| Required deployments | Environment-specific, skipped during migration | Logged in issue comment for manual action |
 | Org-level security managers | Cannot be migrated programmatically | Reported in issue comment for manual action |
 | Webhooks not migrated | Webhooks must be reconfigured manually | Document in runbook |
 | GitHub Pages configuration | Not migrated by GEI | Manual reconfiguration needed |
 | Deploy keys | Not migrated by GEI | Manual reconfiguration needed |
+| Rulesets | Migration attempted but depends on org plan support | Logged with status in post-migration comment |
