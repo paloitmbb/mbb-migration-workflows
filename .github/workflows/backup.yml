@@ -1,0 +1,990 @@
+ame: "MBB GHES to GHEC Migration Workflow"
+ 
+on:
+  repository_dispatch:
+    types: [ghes-migration]
+ 
+# Uses separate PATs for source and target:
+# - GH_SOURCE_PAT: PAT with read access to source GHES repository
+# - GH_TARGET_PAT: PAT with write access to target GHEC organization/user
+# - GH_SOURCE_SERVER_URL: URL of the source GHES instance
+ 
+ 
+jobs:
+  # ─────────────────────────────────────────────
+  # Job 1: Validate migration request
+  # ─────────────────────────────────────────────
+  validate:
+    name: "Validate Migration Request"
+    runs-on: ${{ vars.GHES_RUNNER_OS || vars.RUNNER_OS }}
+    permissions:
+      contents: read
+      issues: write
+    outputs:
+      source_organization: ${{ steps.parse.outputs.issueparser_source_organization }}
+      source_repo: ${{ steps.parse.outputs.issueparser_source_repo }}
+      target_organization: ${{ steps.parse.outputs.issueparser_target_organization }}
+      target_repo: ${{ steps.parse.outputs.issueparser_target_repo }}
+      application_tier: ${{ steps.parse.outputs.issueparser_application_tier }}
+      team_mappings: ${{ steps.parse.outputs.issueparser_team_mappings }}
+      justification: ${{ steps.parse.outputs.issueparser_justification }}
+      issue_number: ${{ github.event.client_payload.issue_number }}
+ 
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+ 
+      - name: Setup GH CLI
+        run: |
+          GH_VERSION="2.38.0"
+          OS="$(uname -s)"
+          ARCH="$(uname -m)"
+          case "$ARCH" in
+            x86_64) ARCH_NORM="amd64" ;;
+            aarch64|arm64) ARCH_NORM="arm64" ;;
+            *) ARCH_NORM="$ARCH" ;;
+          esac
+          if [ "$OS" = "Linux" ]; then
+            curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_${ARCH_NORM}.tar.gz" -o /tmp/gh_cli.tar.gz
+            tar -xzf /tmp/gh_cli.tar.gz -C /tmp
+            sudo mv "/tmp/gh_${GH_VERSION}_linux_${ARCH_NORM}/bin/gh" /usr/local/bin/gh
+            rm -rf /tmp/gh_cli.tar.gz "/tmp/gh_${GH_VERSION}_linux_${ARCH_NORM}"
+          elif [ "$OS" = "Darwin" ]; then
+            curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_macOS_${ARCH_NORM}.zip" -o /tmp/gh_cli.zip
+            unzip -q /tmp/gh_cli.zip -d /tmp/gh_cli_dir
+            sudo mv "/tmp/gh_cli_dir/gh_${GH_VERSION}_macOS_${ARCH_NORM}/bin/gh" /usr/local/bin/gh
+            rm -rf /tmp/gh_cli.zip /tmp/gh_cli_dir
+          fi
+          gh --version
+             
+    #   - name: Validate GHES connectivity
+    #     env:
+    #      SOURCE_URL: https://github.maybank.com
+    #       SOURCE_PAT: ${{ secrets.GHES_SOURCE_PAT }}
+    #     run: |
+    #       set -euo pipefail
+     
+    #       SOURCE_URL="${SOURCE_URL%/}"
+     
+    #       HTTP_CODE=$(curl -sS -o /tmp/ghes_user.json -w "%{http_code}" \
+    #         -H "Authorization: token $SOURCE_PAT" \
+    #         -H "Accept: application/vnd.github+json" \
+    #         "$SOURCE_URL/api/v3/user")
+     
+    #       echo "HTTP_CODE=$HTTP_CODE"
+     
+    #       if [ "$HTTP_CODE" -eq 200 ]; then
+    #         echo "GHES authentication succeeded"
+    #       else
+    #         echo "GHES authentication failed with HTTP $HTTP_CODE"
+    #         exit 1
+    #       fi
+ 
+      - name: Parse Issue Form
+        id: parse
+        uses: maybank-ghes/mss-devops-workflow/actions/ghes-migration-parse-issue@main
+        with:
+          issue-body: ${{ github.event.client_payload.issue_body }}
+          field-mapping: |
+            {
+              "source_organization": "Source Organization",
+              "source_repo": "Source Repository Name",
+              "target_organization": "Target Organization",
+              "target_repo": "Target Repository Name",
+              "application_tier": "Application Tier",
+              "team_mappings": "Team Access Mappings",
+              "justification": "Justification"
+            }
+          textarea-fields: |
+            ["team_mappings", "justification"]
+ 
+      - name: Validate GHES connectivity
+        env:
+          SOURCE_URL: ${{ vars.GH_SOURCE_SERVER_URL }}
+          SOURCE_PAT: ${{ secrets.GH_SOURCE_PAT }}
+        run: |
+          set -euo pipefail
+
+          SOURCE_URL="${SOURCE_URL%/}"
+
+          HTTP_CODE=$(curl -sS -o /dev/null -w "%{http_code}" \
+            -H "Authorization: token $SOURCE_PAT" \
+            -H "Accept: application/vnd.github+json" \
+            "$SOURCE_URL/api/v3/user")
+
+          echo "HTTP_CODE=$HTTP_CODE"
+
+          if [ "$HTTP_CODE" = "000" ]; then
+            echo "❌ Cannot reach GHES at $SOURCE_URL (network/DNS/SSL failure)"
+            exit 1
+          elif [ "$HTTP_CODE" -eq 200 ]; then
+            echo "✅ GHES authentication succeeded"
+          elif [ "$HTTP_CODE" -eq 401 ]; then
+            echo "❌ PAT is invalid or expired (HTTP 401)"
+            exit 1
+          else
+            echo "❌ GHES authentication failed with HTTP $HTTP_CODE"
+            exit 1
+          fi
+ 
+ 
+      - name: Validate migration repositories
+        uses: maybank-ghes/mss-devops-workflow/actions/ghes-validate-repos@main
+        with:
+          source-server-url: ${{ vars.GH_SOURCE_SERVER_URL }}
+          source-org: ${{ steps.parse.outputs.issueparser_source_organization }}
+          source-repo: ${{ steps.parse.outputs.issueparser_source_repo }}
+          target-org: ${{ steps.parse.outputs.issueparser_target_organization }}
+          target-repo: ${{ steps.parse.outputs.issueparser_target_repo }}
+          source-pat: ${{ secrets.GH_SOURCE_PAT }}
+          target-pat: ${{ secrets.GH_TARGET_PAT }}
+          issue-number: ${{ github.event.client_payload.issue_number }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+ 
+      - name: Label as in-progress
+        env:
+          ISSUE_NUMBER: ${{ github.event.client_payload.issue_number }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh label create "in-progress" --color "FBCA04" --description "Request is being processed" --force 2>/dev/null || true
+          gh issue edit "$ISSUE_NUMBER" --add-label "in-progress"
+
+ 
+  # ─────────────────────────────────────────────
+  # Job 2: Pre-migration — record state & lock
+  # ─────────────────────────────────────────────
+  pre-migration:
+    name: "Pre-Migration Setup"
+    needs: [validate]
+    runs-on: ${{ vars.GHES_RUNNER_OS || vars.RUNNER_OS }}
+    permissions:
+      contents: read
+      issues: write
+    outputs:
+      source_branches: ${{ steps.source-stats.outputs.branches }}
+      source_tags: ${{ steps.source-stats.outputs.tags }}
+      source_head_sha: ${{ steps.source-stats.outputs.head_sha }}
+      source_default_branch: ${{ steps.source-stats.outputs.default_branch }}
+      source_protected_branches: ${{ steps.source-stats.outputs.protected_branches }}
+      source_pr_count: ${{ steps.source-stats.outputs.pr_count }}
+      source_issue_count: ${{ steps.source-stats.outputs.issue_count }}
+      source_release_count: ${{ steps.source-stats.outputs.release_count }}
+      source_repo_size: ${{ steps.source-stats.outputs.repo_size }}
+      source_last_push: ${{ steps.source-stats.outputs.last_push }}
+      source_last_update: ${{ steps.source-stats.outputs.last_update }}
+      source_pr_review_count: ${{ steps.source-stats.outputs.pr_review_count }}
+      source_created: ${{ steps.source-stats.outputs.created }}
+      source_has_codeowners: ${{ steps.source-stats.outputs.has_codeowners }}
+      source_variables_count: ${{ steps.source-stats.outputs.variables_count }}
+      source_variables_list: ${{ steps.source-stats.outputs.variables_list }}
+      source_secrets_count: ${{ steps.source-stats.outputs.secrets_count }}
+      source_secrets_list: ${{ steps.source-stats.outputs.secrets_list }}
+      source_environments_list: ${{ steps.source-stats.outputs.environments_list }}
+      source_env_secrets_list: ${{ steps.source-stats.outputs.env_secrets_list }}
+      source_env_variables_list: ${{ steps.source-stats.outputs.env_variables_list }}
+      source_org_secrets_count: ${{ steps.source-stats.outputs.org_secrets_count }}
+      source_org_secrets_list: ${{ steps.source-stats.outputs.org_secrets_list }}
+      source_org_variables_count: ${{ steps.source-stats.outputs.org_variables_count }}
+      source_org_variables_list: ${{ steps.source-stats.outputs.org_variables_list }}
+      dependabot_alerts_count: ${{ steps.security-alerts.outputs.dependabot_alerts_count }}
+      dependabot_critical_count: ${{ steps.security-alerts.outputs.dependabot_critical_count }}
+      dependabot_high_count: ${{ steps.security-alerts.outputs.dependabot_high_count }}
+      dependabot_medium_count: ${{ steps.security-alerts.outputs.dependabot_medium_count }}
+      dependabot_low_count: ${{ steps.security-alerts.outputs.dependabot_low_count }}
+      dependabot_alert_names: ${{ steps.security-alerts.outputs.dependabot_alert_names }}
+      dependabot_summary: ${{ steps.security-alerts.outputs.dependabot_summary }}
+      code_scanning_alerts_count: ${{ steps.security-alerts.outputs.code_scanning_alerts_count }}
+      code_scanning_critical_count: ${{ steps.security-alerts.outputs.code_scanning_critical_count }}
+      code_scanning_high_count: ${{ steps.security-alerts.outputs.code_scanning_high_count }}
+      code_scanning_medium_count: ${{ steps.security-alerts.outputs.code_scanning_medium_count }}
+      code_scanning_low_count: ${{ steps.security-alerts.outputs.code_scanning_low_count }}
+      code_scanning_alert_names: ${{ steps.security-alerts.outputs.code_scanning_alert_names }}
+      code_scanning_summary: ${{ steps.security-alerts.outputs.code_scanning_summary }}
+      total_alerts_count: ${{ steps.security-alerts.outputs.total_alerts_count }}
+      has_critical_alerts: ${{ steps.security-alerts.outputs.has_critical_alerts }}
+      overall_security_summary: ${{ steps.security-alerts.outputs.overall_summary }}
+ 
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+ 
+      - name: Setup GH CLI
+        shell: bash 
+        run: |
+          GH_VERSION="2.38.0"
+          OS="$(uname -s)"
+          ARCH="$(uname -m)"
+          case "$ARCH" in
+            x86_64) ARCH_NORM="amd64" ;;
+            aarch64|arm64) ARCH_NORM="arm64" ;;
+            *) ARCH_NORM="$ARCH" ;;
+          esac
+          if [ "$OS" = "Linux" ]; then
+            curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_${ARCH_NORM}.tar.gz" -o /tmp/gh_cli.tar.gz
+            tar -xzf /tmp/gh_cli.tar.gz -C /tmp
+            sudo mv "/tmp/gh_${GH_VERSION}_linux_${ARCH_NORM}/bin/gh" /usr/local/bin/gh
+            rm -rf /tmp/gh_cli.tar.gz "/tmp/gh_${GH_VERSION}_linux_${ARCH_NORM}"
+          elif [ "$OS" = "Darwin" ]; then
+            curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_macOS_${ARCH_NORM}.zip" -o /tmp/gh_cli.zip
+            unzip -q /tmp/gh_cli.zip -d /tmp/gh_cli_dir
+            sudo mv "/tmp/gh_cli_dir/gh_${GH_VERSION}_macOS_${ARCH_NORM}/bin/gh" /usr/local/bin/gh
+            rm -rf /tmp/gh_cli.zip /tmp/gh_cli_dir
+          fi
+          gh --version
+ 
+      - name: Gather source repository stats from GHES
+        id: source-stats
+        uses: maybank-ghes/mss-devops-workflow/actions/ghes-source-repo-stats@main
+        with:
+          source-server-url: ${{ vars.GH_SOURCE_SERVER_URL }}
+          source-org: ${{ needs.validate.outputs.source_organization }}
+          source-repo: ${{ needs.validate.outputs.source_repo }}
+          source-pat: ${{ secrets.GH_SOURCE_PAT }}
+ 
+      - name: Gather security alerts from source repository
+        id: security-alerts
+        uses: maybank-ghes/mss-devops-workflow/actions/ghes-security-alerts@main
+        with:
+          source-server-url: ${{ vars.GH_SOURCE_SERVER_URL }}
+          repository: ${{ needs.validate.outputs.source_organization }}/${{ needs.validate.outputs.source_repo }}
+          token: ${{ secrets.GH_SOURCE_PAT }}
+ 
+      - name: Post pre-migration summary
+        uses: actions/github-script@v7
+        env:
+          SOURCE_SERVER_URL: ${{ vars.GH_SOURCE_SERVER_URL }}
+          ISSUE_NUMBER: ${{ github.event.client_payload.issue_number }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+ 
+            const sourceServerUrl = process.env.SOURCE_SERVER_URL;
+
+            const sourceOrg = '${{ needs.validate.outputs.source_organization }}';
+            const sourceRepo = '${{ needs.validate.outputs.source_repo }}';
+            const issueNum = parseInt(process.env.ISSUE_NUMBER, 10); 
+            const targetOrg = '${{ needs.validate.outputs.target_organization }}';
+            const targetRepo = '${{ needs.validate.outputs.target_repo }}';
+            const applicationTier = '${{ needs.validate.outputs.application_tier }}';
+            const teamMappings = '${{ needs.validate.outputs.team_mappings }}';
+            const validateOutputs = ${{ toJson(needs.validate.outputs) }};
+            const justification = validateOutputs.justification;
+ 
+            // Repo stats from source-stats step
+            const repoSize = '${{ steps.source-stats.outputs.repo_size }}';
+            const defaultBranch = '${{ steps.source-stats.outputs.default_branch }}';
+            const headSha = '${{ steps.source-stats.outputs.head_sha }}';
+            const branches = '${{ steps.source-stats.outputs.branches }}';
+            const tags = '${{ steps.source-stats.outputs.tags }}';
+            const protectedBranches = '${{ steps.source-stats.outputs.protected_branches }}';
+            const prCount = '${{ steps.source-stats.outputs.pr_count }}';
+            const issueCount = '${{ steps.source-stats.outputs.issue_count }}';
+            const releaseCount = '${{ steps.source-stats.outputs.release_count }}';
+            const lastUpdate = '${{ steps.source-stats.outputs.last_update }}';
+            const lastPush = '${{ steps.source-stats.outputs.last_push }}';
+            const prReviewCount = '${{ steps.source-stats.outputs.pr_review_count }}';
+            const created = '${{ steps.source-stats.outputs.created }}';
+            const hasCodeowners = '${{ steps.source-stats.outputs.has_codeowners }}'; 
+            const sourceSecretsCount = '${{ steps.source-stats.outputs.secrets_count }}';
+            const sourceSecretsList = '${{ steps.source-stats.outputs.secrets_list }}';
+            const sourceEnvSecretsList = '${{ steps.source-stats.outputs.env_secrets_list }}';
+            const sourceEnvVariablesList = '${{ steps.source-stats.outputs.env_variables_list }}';
+            const sourceOrgSecretsCount = '${{ steps.source-stats.outputs.org_secrets_count }}';
+            const sourceOrgSecretsList = '${{ steps.source-stats.outputs.org_secrets_list }}';
+            const sourceVariablesCount = '${{ steps.source-stats.outputs.variables_count }}';
+            const sourceVariablesList = '${{ steps.source-stats.outputs.variables_list }}';
+            const sourceOrgVariablesCount = '${{ steps.source-stats.outputs.org_variables_count }}';
+            const sourceOrgVariablesList = '${{ steps.source-stats.outputs.org_variables_list }}';
+            const dependabotAlertsCount = '${{ steps.security-alerts.outputs.dependabot_alerts_count }}';
+            const dependabotCritical = '${{ steps.security-alerts.outputs.dependabot_critical_count }}';
+            const dependabotHigh = '${{ steps.security-alerts.outputs.dependabot_high_count }}';
+            const dependabotMedium = '${{ steps.security-alerts.outputs.dependabot_medium_count }}';
+            const dependabotLow = '${{ steps.security-alerts.outputs.dependabot_low_count }}';
+            const codeScanningAlertsCount = '${{ steps.security-alerts.outputs.code_scanning_alerts_count }}';
+            const codeScanningCritical = '${{ steps.security-alerts.outputs.code_scanning_critical_count }}';
+            const codeScanningHigh = '${{ steps.security-alerts.outputs.code_scanning_high_count }}';
+            const codeScanningMedium = '${{ steps.security-alerts.outputs.code_scanning_medium_count }}';
+            const codeScanningLow = '${{ steps.security-alerts.outputs.code_scanning_low_count }}';
+            const hasCriticalAlerts = '${{ steps.security-alerts.outputs.has_critical_alerts }}';
+            const overallSecuritySummary = '${{ steps.security-alerts.outputs.overall_summary }}';
+            let teamBlock = '';
+            if (teamMappings && teamMappings.trim()) {
+              teamBlock = '```\n' + teamMappings + '\n```\n';
+            }
+ 
+            let justificationBlock = '';
+            if (justification && justification.trim()) {
+              justificationBlock = '> ' + justification.split('\n').join('\n> ') + '\n';
+            }
+ 
+            // ── 1. Post issue comment ──
+            let commentBody = '## 📋 Pre-Migration Summary (GHES → GHEC)\n\n';
+            commentBody += '✅ **Validation passed — pre-migration setup complete!**\n\n';
+            commentBody += '### Migration Details\n';
+            commentBody += `- **Migration Type:** GHES → GHEC (via GitHub-owned storage)\n`;
+            // commentBody += `- **Source GHES URL:** \`${sourceServerUrl}\`\n`;
+            commentBody += `- **Source Repository:** \`${sourceOrg}/${sourceRepo}\`\n`;
+            commentBody += `- **Target Repository (GHEC):** \`${targetOrg}/${targetRepo}\`\n`;
+            commentBody += `- **Application Tier:** \`${applicationTier}\`\n\n`;
+ 
+            commentBody += '### 📊 Source Repository Stats (GHES)\n\n';
+            commentBody += '| Metric | Value |\n';
+            commentBody += '|--------|-------|\n';
+            commentBody += `| **Size** | ${repoSize} |\n`;
+            commentBody += `| **Default Branch** | ${defaultBranch} |\n`;
+            commentBody += `| **HEAD SHA** | \`${headSha}\` |\n`;
+            commentBody += `| **Branches** | ${branches} |\n`;
+            commentBody += `| **Tags** | ${tags} |\n`;
+            commentBody += `| **Protected Branches** | ${protectedBranches} |\n`;
+            commentBody += `| **PR Count** | ${prCount} |\n`;
+            commentBody += `| **Issue Count** | ${issueCount} |\n`;
+            commentBody += `| **Releases** | ${releaseCount} |\n`;
+            commentBody += `| **Last Push** | ${lastPush} |\n`;
+            commentBody += `| **Last Update** | ${lastUpdate} |\n`;
+            commentBody += `| **PR Review Count** | ${prReviewCount} |\n`;
+            commentBody += `| **Created** | ${created} |\n`;
+            commentBody += `| **CODEOWNERS** | ${hasCodeowners === 'true' ? '✅ Present' : '⚠️ Not found'} |\n\n`;
+            commentBody += '### 🔑 Secrets & Variables\n\n'; 
+            commentBody += `- **Repo Secrets Count:** ${sourceSecretsCount}\n`;
+            commentBody += `- **Repo Secrets List:** ${sourceSecretsList}\n`;
+            commentBody += `- **Env Secrets List:** ${sourceEnvSecretsList}\n`;
+            commentBody += `- **Env Variables List:** ${sourceEnvVariablesList}\n`;
+            commentBody += `- **Org Secrets Count:** ${sourceOrgSecretsCount}\n`;
+            commentBody += `- **Org Secrets List:** ${sourceOrgSecretsList}\n`;
+            commentBody += `- **Repo Variables Count:** ${sourceVariablesCount}\n`;
+            commentBody += `- **Repo Variables List:** ${sourceVariablesList}\n`;
+            commentBody += `- **Org Variables Count:** ${sourceOrgVariablesCount}\n`;
+            commentBody += `- **Org Variables List:** ${sourceOrgVariablesList}\n\n`;
+                        commentBody += '### 🔐 Security Alerts\n\n';
+            commentBody += '| Type | Total | Critical | High | Medium | Low |\n';
+            commentBody += '|------|-------|----------|------|--------|-----|\n';
+            commentBody += `| **Dependabot** | ${dependabotAlertsCount || '0'} | ${dependabotCritical || '0'} | ${dependabotHigh || '0'} | ${dependabotMedium || '0'} | ${dependabotLow || '0'} |\n`;
+            commentBody += `| **Code Scanning** | ${codeScanningAlertsCount || '0'} | ${codeScanningCritical || '0'} | ${codeScanningHigh || '0'} | ${codeScanningMedium || '0'} | ${codeScanningLow || '0'} |\n\n`;
+            if (hasCriticalAlerts === 'true') {
+              commentBody += '> 🚨 **Critical security alerts detected — review before proceeding with migration!**\n\n';
+            }
+ 
+            if (hasCodeowners !== 'true') {
+              commentBody += '### ⚠️ CODEOWNERS Alert\n';
+              commentBody += '> **The CODEOWNERS file is not present in the source repository and it will be injected by default in the destination repo.**\n\n';
+            }
+ 
+            if (teamBlock) commentBody += '### 👥 Team Access Mappings\n' + teamBlock + '\n';
+            if (justificationBlock) commentBody += '### 📝 Justification\n' + justificationBlock + '\n';
+            commentBody += '---\n\n';
+            commentBody += '⏳ **Awaiting approval to proceed with GHES → GHEC migration...**\n';
+ 
+ 
+            await github.rest.issues.createComment({
+              issue_number: issueNum,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: commentBody
+            });
+ 
+            // ── 2. Add labels ──
+            await github.rest.issues.addLabels({
+              issue_number: issueNum,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: ['validation-passed', 'ghes-to-ghec-migration']
+            });
+ 
+            // ── 3. Write workflow job summary ──
+            let summary = '# 📋 Pre-Migration Summary (GHES → GHEC)\n\n';
+            summary += '## ✅ Validation passed — pre-migration setup complete!\n\n';
+            summary += '### 📋 Migration Details\n\n';
+            summary += '| Field | Value |\n';
+            summary += '|-------|-------|\n';
+            summary += `| **Migration Type** | GHES → GHEC (via GitHub-owned storage) |\n`;
+            summary += `| **Source GHES URL** | \`${sourceServerUrl}\` |\n`;
+            summary += `| **Source Repository** | \`${sourceOrg}/${sourceRepo}\` |\n`;
+            summary += `| **Target Repository** | \`${targetOrg}/${targetRepo}\` |\n`;
+            summary += `| **Application Tier** | \`${applicationTier}\` |\n\n`;
+ 
+            summary += '### 📊 Source Repository Stats (GHES)\n\n';
+            summary += '| Metric | Value |\n';
+            summary += '|--------|-------|\n';
+            summary += `| **Size** | ${repoSize} |\n`;
+            summary += `| **Default Branch** | ${defaultBranch} |\n`;
+            summary += `| **HEAD SHA** | \`${headSha}\` |\n`;
+            summary += `| **Branches** | ${branches} |\n`;
+            summary += `| **Tags** | ${tags} |\n`;
+            summary += `| **Protected Branches** | ${protectedBranches} |\n`;
+            summary += `| **PR Count** | ${prCount} |\n`;
+            summary += `| **Issue Count** | ${issueCount} |\n`;
+            summary += `| **Releases** | ${releaseCount} |\n`;
+            summary += `| **Last Push** | ${lastPush} |\n`;
+            summary += `| **Last Update** | ${lastUpdate} |\n`;
+            summary += `| **PR Review Count** | ${prReviewCount} |\n`;
+            summary += `| **Created** | ${created} |\n`;
+ 
+            summary += `| **CODEOWNERS** | ${hasCodeowners === 'true' ? '✅ Present' : '⚠️ Not found'} |\n\n`;
+            
+
+            summary += '### 🔐 Security Alerts\n\n';
+            summary += '| Type | Total | Critical | High | Medium | Low |\n';
+            summary += '|------|-------|----------|------|--------|-----|\n';
+            summary += `| **Dependabot** | ${dependabotAlertsCount || '0'} | ${dependabotCritical || '0'} | ${dependabotHigh || '0'} | ${dependabotMedium || '0'} | ${dependabotLow || '0'} |\n`;
+            summary += `| **Code Scanning** | ${codeScanningAlertsCount || '0'} | ${codeScanningCritical || '0'} | ${codeScanningHigh || '0'} | ${codeScanningMedium || '0'} | ${codeScanningLow || '0'} |\n\n`;
+            if (hasCriticalAlerts === 'true') {
+              summary += '> 🚨 **Critical security alerts detected!**\n\n';
+            }
+            summary += `> ${overallSecuritySummary}\n\n`;
+            if (hasCodeowners !== 'true') {
+              summary += '### ⚠️ CODEOWNERS Alert\n\n';
+              summary += '> **The CODEOWNERS file is not present in the source repository and it will be injected by default in the destination repo.**\n\n';
+            }
+ 
+            if (teamBlock) summary += '\n### 👥 Team Access Mappings\n\n' + teamBlock;
+            if (justificationBlock) summary += '\n### 📝 Justification\n\n' + justificationBlock;
+            summary += '\n---\n';
+
+            await core.summary.addRaw(summary).write();
+    
+#─────────────────────────────────────────────
+# Job 4: Approval Gate - requires manual approval after validation
+# ─────────────────────────────────────────────
+manual-approval:
+  name: "Migration Approval Gate"
+  needs: [validate, pre-migration, determine-environment]
+  runs-on: ${{ vars.GHES_RUNNER_OS || vars.RUNNER_OS }}
+  environment:
+    name: ${{ needs.determine-environment.outputs.environment }}
+  permissions:
+    issues: write
+    contents: read
+  steps:
+
+    - name: Setup GH CLI
+      run: |
+        GH_VERSION="2.38.0"
+        OS="$(uname -s)"
+        ARCH="$(uname -m)"
+        case "$ARCH" in
+          x86_64) ARCH_NORM="amd64" ;;
+          aarch64|arm64) ARCH_NORM="arm64" ;;
+          *) ARCH_NORM="$ARCH" ;;
+        esac
+        if [ "$OS" = "Linux" ]; then
+          curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_${ARCH_NORM}.tar.gz" -o /tmp/gh_cli.tar.gz
+          tar -xzf /tmp/gh_cli.tar.gz -C /tmp
+          sudo mv "/tmp/gh_${GH_VERSION}_linux_${ARCH_NORM}/bin/gh" /usr/local/bin/gh
+          rm -rf /tmp/gh_cli.tar.gz "/tmp/gh_${GH_VERSION}_linux_${ARCH_NORM}"
+        elif [ "$OS" = "Darwin" ]; then
+          curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_macOS_${ARCH_NORM}.zip" -o /tmp/gh_cli.zip
+          unzip -q /tmp/gh_cli.zip -d /tmp/gh_cli_dir
+          sudo mv "/tmp/gh_cli_dir/gh_${GH_VERSION}_macOS_${ARCH_NORM}/bin/gh" /usr/local/bin/gh
+          rm -rf /tmp/gh_cli.zip /tmp/gh_cli_dir
+        fi
+        gh --version
+
+    - name: Comment approval requested
+      run: |
+        gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --body "### 🔐 Approval Required
+
+        Validation has passed for **GHES → GHEC** migration. A manual approval is now required to proceed.
+
+        | Field | Value |
+        |-------|-------|
+        | **Source Repo** | \`${SOURCE_ORG}/${SOURCE_REPO}\` |
+        | **Target (GHEC)** | \`${TARGET_ORG}/${TARGET_REPO}\` |
+        | **Application Tier** | \`${APPLICATION_TIER}\` |
+        | **Environment** | \`${ENVIRONMENT}\` |
+
+        ⏳ Waiting for a member of the **${ENVIRONMENT}** environment reviewers to approve...
+
+        ---
+        *Automated by GitHub Actions workflow*"
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        ISSUE_NUMBER: ${{ github.event.client_payload.issue_number }}
+        SOURCE_ORG: ${{ needs.validate.outputs.source_organization }}
+        SOURCE_REPO: ${{ needs.validate.outputs.source_repo }}
+        TARGET_ORG: ${{ needs.validate.outputs.target_organization }}
+        TARGET_REPO: ${{ needs.validate.outputs.target_repo }}
+        APPLICATION_TIER: ${{ needs.validate.outputs.application_tier }}
+        ENVIRONMENT: ${{ needs.determine-environment.outputs.environment }}
+
+    - name: Approval granted
+      run: echo "✅ Migration approved — proceeding to next steps."
+
+    - name: Comment approval granted
+      run: |
+        gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --body "### ✅ Migration Approved
+
+        The GHES → GHEC migration has been approved. Proceeding with the next steps.
+
+        ---
+        *Automated by GitHub Actions workflow*"
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        ISSUE_NUMBER: ${{ github.event.client_payload.issue_number }}
+    
+    # ─────────────────────────────────────────────
+    # Job 5: Execute migration via GEI (GHES → GHEC)
+    # ─────────────────────────────────────────────
+  migrate:
+        name: "Execute GEI Migration (GHES → GHEC)"
+        needs: [validate, approval]
+        runs-on: ${{ vars.GHES_RUNNER_OS || vars.RUNNER_OS }}
+        permissions:
+        issues: write
+    
+        steps:
+        - name: Setup GH CLI
+          run: |
+            GH_VERSION="2.38.0"
+            OS="$(uname -s)"
+            ARCH="$(uname -m)"
+            case "$ARCH" in
+                x86_64) ARCH_NORM="amd64" ;;
+                aarch64|arm64) ARCH_NORM="arm64" ;;
+                *) ARCH_NORM="$ARCH" ;;
+            esac
+            if [ "$OS" = "Linux" ]; then
+                curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_${ARCH_NORM}.tar.gz" -o /tmp/gh_cli.tar.gz
+                tar -xzf /tmp/gh_cli.tar.gz -C /tmp
+                sudo mv "/tmp/gh_${GH_VERSION}_linux_${ARCH_NORM}/bin/gh" /usr/local/bin/gh
+                rm -rf /tmp/gh_cli.tar.gz "/tmp/gh_${GH_VERSION}_linux_${ARCH_NORM}"
+            elif [ "$OS" = "Darwin" ]; then
+                curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_macOS_${ARCH_NORM}.zip" -o /tmp/gh_cli.zip
+                unzip -q /tmp/gh_cli.zip -d /tmp/gh_cli_dir
+                sudo mv "/tmp/gh_cli_dir/gh_${GH_VERSION}_macOS_${ARCH_NORM}/bin/gh" /usr/local/bin/gh
+                rm -rf /tmp/gh_cli.zip /tmp/gh_cli_dir
+            fi
+            gh --version
+    
+        - name: Install GEI CLI
+            run: |
+            gh extension install github/gh-gei || true
+            gh gei --version
+            env:
+            GH_TOKEN: ${{ secrets.GH_TARGET_PAT }}
+    
+        - name: Run GEI migration (GHES → GHEC)
+            id: gei
+            run: |
+            SOURCE_URL="${{ vars.GH_SOURCE_SERVER_URL }}"
+            SOURCE_URL="${SOURCE_URL%/}"
+            SRC_ORG="${{ needs.validate.outputs.source_organization }}"
+            SRC_REPO="${{ needs.validate.outputs.source_repo }}"
+            TGT_ORG="${{ needs.validate.outputs.target_organization }}"
+            TGT_REPO="${{ needs.validate.outputs.target_repo }}"
+    
+            echo "🚀 Starting GEI migration (GHES → GHEC)..."
+            echo "   Source GHES: ${SOURCE_URL}"
+            echo "   Source Repo: ${SRC_ORG}/${SRC_REPO}"
+            echo "   Target GHEC: ${TGT_ORG}/${TGT_REPO}"
+            echo "   Mode: GitHub-owned storage (GHES 3.15.3)"
+            echo "🔒 Source repository will be locked during migration to prevent changes"
+    
+            gh gei migrate-repo \
+                --github-source-org "$SRC_ORG" \
+                --source-repo "$SRC_REPO" \
+                --github-target-org "$TGT_ORG" \
+                --target-repo "$TGT_REPO" \
+                --target-repo-visibility "private" \
+                --ghes-api-url "${SOURCE_URL}/api/v3" \
+                --use-github-storage \
+                --lock-source-repo \
+                --verbose 2>&1 | tee /tmp/gei_output.txt
+    
+            GEI_EXIT=$?
+            echo "exit_code=$GEI_EXIT" >> $GITHUB_OUTPUT
+    
+            if [ "$GEI_EXIT" -ne 0 ]; then
+                echo "❌ GEI migration failed"
+                exit 1
+            fi
+    
+            echo "✅ GEI migration command completed (GHES → GHEC)"
+            env:
+            GH_SOURCE_PAT: ${{ secrets.GH_SOURCE_PAT }}
+            GH_PAT: ${{ secrets.GH_TARGET_PAT }}
+    
+    
+    # ─────────────────────────────────────────────
+    # Job 6: Post-migration setup
+    # ─────────────────────────────────────────────
+    post-migration:
+        name: "Post-Migration Setup"
+        needs: [validate, pre-migration, migrate]
+        runs-on: ${{ vars.GHES_RUNNER_OS || vars.RUNNER_OS }}
+        permissions:
+        issues: write
+        steps:
+        - name: Setup GH CLI
+            run: |
+            GH_VERSION="2.38.0"
+            OS="$(uname -s)"
+            ARCH="$(uname -m)"
+            case "$ARCH" in
+                x86_64) ARCH_NORM="amd64" ;;
+                aarch64|arm64) ARCH_NORM="arm64" ;;
+                *) ARCH_NORM="$ARCH" ;;
+            esac
+            if [ "$OS" = "Linux" ]; then
+                curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_${ARCH_NORM}.tar.gz" -o /tmp/gh_cli.tar.gz
+                tar -xzf /tmp/gh_cli.tar.gz -C /tmp
+                sudo mv "/tmp/gh_${GH_VERSION}_linux_${ARCH_NORM}/bin/gh" /usr/local/bin/gh
+                rm -rf /tmp/gh_cli.tar.gz "/tmp/gh_${GH_VERSION}_linux_${ARCH_NORM}"
+            elif [ "$OS" = "Darwin" ]; then
+                curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_macOS_${ARCH_NORM}.zip" -o /tmp/gh_cli.zip
+                unzip -q /tmp/gh_cli.zip -d /tmp/gh_cli_dir
+                sudo mv "/tmp/gh_cli_dir/gh_${GH_VERSION}_macOS_${ARCH_NORM}/bin/gh" /usr/local/bin/gh
+                rm -rf /tmp/gh_cli.zip /tmp/gh_cli_dir
+            fi
+            gh --version
+    
+        - name: Wait for GitHub.com to finalize
+            run: |
+            echo "⏳ Waiting 15 seconds for GitHub.com to finalize import..."
+            sleep 15
+    
+        - name: Debug team mappings value
+            run: |
+            echo "📋 Team mappings value check in post-migration job:"
+            echo "Raw value from validate job: '${{ needs.validate.outputs.team_mappings }}'"
+            echo "Is empty check: $([ -z '${{ needs.validate.outputs.team_mappings }}' ] && echo 'YES - EMPTY' || echo 'NO - HAS VALUE')"
+            echo "Is null check: $([ '${{ needs.validate.outputs.team_mappings }}' = 'null' ] && echo 'YES - NULL' || echo 'NO - NOT NULL')"
+            echo "Length in bash: ${#TEAM_MAPPINGS}"
+    
+            if [ -z "$TEAM_MAPPINGS" ]; then
+                echo ""
+                echo "❌ PROBLEM IDENTIFIED: Team mappings is EMPTY"
+                echo "Possible reasons:"
+                echo "  1. 'Team Access Mappings' field was not filled in the issue form"
+                echo "  2. Field name in issue form does not match exactly: 'Team Access Mappings'"
+                echo "  3. Parser action failed to extract the value"
+                echo ""
+                echo "Expected format in issue form field:"
+                echo "  mss-devsecops-team:admin"
+                echo "  OR"
+                echo "  mss-devsecops-team : admin"
+            else
+                echo ""
+                echo "✅ Team mappings has content - step will run"
+                echo "Content preview: ${TEAM_MAPPINGS:0:100}..."
+            fi
+            env:
+            TEAM_MAPPINGS: ${{ needs.validate.outputs.team_mappings }}
+    
+        - name: Apply team access mappings
+            if: needs.validate.outputs.team_mappings != '' && needs.validate.outputs.team_mappings != null  && needs.validate.outputs.team_mappings != 'null'
+            env:
+            GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+            TEAM_MAPPINGS: ${{ needs.validate.outputs.team_mappings }}
+            run: |
+            TGT_ORG="${{ needs.validate.outputs.target_organization }}"
+            TGT_REPO="${{ needs.validate.outputs.target_repo }}"
+            TOKEN="${{ secrets.GH_TARGET_PAT }}"
+    
+            echo "👥 Applying team access mappings..."
+    
+            # Decode %0A (URL-encoded newlines from GHA job outputs)
+            DECODED_MAPPINGS=$(printf '%s' "$TEAM_MAPPINGS" | sed 's/%0A/\n/g; s/%0a/\n/g')
+    
+            printf '%s\n' "$DECODED_MAPPINGS" | while IFS= read -r LINE; do
+                LINE=$(echo "$LINE" | xargs)
+                [ -z "$LINE" ] && continue
+                [[ "$LINE" == \#* ]] && continue
+    
+                # Expect format: "team-slug : permission"
+                if ! printf '%s' "$LINE" | grep -q ":"; then
+                echo "   ⚠️ Skipping invalid mapping (missing ':'): $LINE"
+                continue
+                fi
+    
+                TARGET_TEAM=$(printf '%s' "$LINE" | sed 's/:.*//' | xargs)
+                PERMISSION=$(printf '%s' "$LINE" | sed 's/.*://' | xargs)
+    
+                # Validate permission value
+                case "$PERMISSION" in
+                pull|push|admin|maintain|triage) ;;
+                *)
+                    echo "   ⚠️ Invalid permission '$PERMISSION' for team '$TARGET_TEAM' — defaulting to push"
+                    PERMISSION="push"
+                    ;;
+                esac
+    
+                echo "   → Team: $TARGET_TEAM | Permission: $PERMISSION"
+    
+                HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+                -X PUT \
+                -H "Authorization: Bearer $TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                -H "Content-Type: application/json" \
+                -d "{\"permission\": \"$PERMISSION\"}" \
+                "https://api.github.com/orgs/${TGT_ORG}/teams/${TARGET_TEAM}/repos/${TGT_ORG}/${TGT_REPO}")
+    
+                if [ "$HTTP_CODE" = "204" ]; then
+                echo "   ✅ $TARGET_TEAM — $PERMISSION"
+                else
+                echo "   ⚠️ $TARGET_TEAM — HTTP $HTTP_CODE (check team slug exists in org: $TGT_ORG)"
+                fi
+            done      
+    
+        - name: Comment post-migration setup
+            run: |
+            
+            DELETED_COUNT="${{ steps.remove-stale.outputs.deleted_count }}"
+            FAILED_COUNT="${{ steps.remove-stale.outputs.failed_count }}"
+            TEAM_MAPPINGS="${{ needs.validate.outputs.team_mappings }}"
+    
+            # Team mappings status
+            TEAM_MSG=""
+            if [ -n "$TEAM_MAPPINGS" ]; then
+                TEAM_MSG="- ✅ **Team access mappings** applied"
+            else
+                TEAM_MSG="- ⚠️ **Team access mappings** skipped (not provided in issue form)"
+            fi
+    
+            STALE_MSG=""
+            if [ -n "$STALE_COUNT" ] && [ "$STALE_COUNT" != "0" ]; then
+                STALE_MSG="- 🧹 Stale branches cleanup: **${DELETED_COUNT:-0}** deleted, **${FAILED_COUNT:-0}** failed (out of ${STALE_COUNT} stale)"
+            else
+                STALE_MSG="- ✅ No stale branches to clean up"
+            fi
+    
+            gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --body "### 🔧 Post-Migration Setup Complete (GHES → GHEC)
+    
+            ${TEAM_MSG}
+            ${STALE_MSG}
+    
+            - ⚠️ **Secrets must be re-created manually** (secret values are not readable via API)
+            - ⚠️ **Branch protection rules** may need manual re-configuration (GHES and GHEC may differ in supported features)
+            - ⚠️ **GHAS settings** should be reviewed and enabled on GHEC as needed
+    
+            📋 Proceeding to close issue..."
+            env:
+            GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+            ISSUE_NUMBER: ${{ needs.validate.outputs.issue_number }}
+            TARGET_ORG: ${{ needs.validate.outputs.target_organization }}
+            TARGET_REPO: ${{ needs.validate.outputs.target_repo }}
+    
+    # ─────────────────────────────────────────────
+    # Job 7: Close issue
+    # ─────────────────────────────────────────────
+    close-issue:
+        name: "Close Issue"
+        needs: [validate, pre-migration, post-migration]
+        runs-on: ${{ vars.GHES_RUNNER_OS || vars.RUNNER_OS }}
+        permissions:
+        issues: write
+    
+        steps:
+        - name: Generate apply summary
+            if: success()
+            uses: actions/github-script@v7
+            with:
+            script: |
+                const sourceOrg = '${{ needs.validate.outputs.source_organization }}';
+                const sourceRepo = '${{ needs.validate.outputs.source_repo }}';
+                const targetOrg = '${{ needs.validate.outputs.target_organization }}';
+                const targetRepo = '${{ needs.validate.outputs.target_repo }}';
+                const applicationTier = '${{ needs.validate.outputs.application_tier }}';
+                const issueNumber = '${{ needs.validate.outputs.issue_number }}';
+                const runId = context.runId;
+                const runUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+                const sourceBranches = '${{ needs.pre-migration.outputs.source_branches }}';
+                const sourceTags = '${{ needs.pre-migration.outputs.source_tags }}';
+                const sourceHeadSha = '${{ needs.pre-migration.outputs.source_head_sha }}';
+                const defaultBranch = '${{ needs.pre-migration.outputs.source_default_branch }}';
+    
+                let summary = '# ✅ GHES → GHEC Migration Completed Successfully!\n\n';
+                summary += '## 🎉 Migration Details\n\n';
+                summary += '| Field | Value |\n';
+                summary += '|-------|-------|\n';
+                summary += `| **Migration Type** | GHES → GHEC (via GitHub-owned storage) |\n`;
+                summary += `| **Source GHES URL** | \`${{ vars.GH_SOURCE_SERVER_URL }}\` |\n`;
+                summary += `| **Source Repository** | \`${sourceOrg}/${sourceRepo}\` |\n`;
+                summary += `| **Target Repository (GHEC)** | [\`${targetOrg}/${targetRepo}\`](https://github.com/${targetOrg}/${targetRepo}) |\n`;
+                summary += `| **Application Tier** | \`${applicationTier}\` |\n`;
+                summary += `| **Default Branch** | \`${defaultBranch}\` |\n`;
+                summary += `| **Workflow Run** | [#${runId}](${runUrl}) |\n`;
+                summary += `| **Source Issue** | [#${issueNumber}](https://github.com/${context.repo.owner}/${context.repo.repo}/issues/${issueNumber}) |\n\n`;
+    
+                summary += '## 📊 Source Repository Stats\n\n';
+                summary += '| Metric | Value |\n';
+                summary += '|--------|-------|\n';
+                summary += `| **Branches** | ${sourceBranches} |\n`;
+                summary += `| **Tags** | ${sourceTags} |\n`;
+                summary += `| **HEAD SHA** | \`${sourceHeadSha.substring(0, 12)}\` |\n`;
+    
+                summary += '## 📦 Post-Migration Actions\n\n';
+    
+                const teammappings = '${{ needs.validate.outputs.team_mappings }}';
+                if (teammappings && teammappings.trim()){
+                summary += `- ✅ Team access mappings applied\n\n`;
+                } else {
+                summary += `- ⚠️ Team access mappings skipped (not provided in issue form)\n\n`;
+                }
+                summary += '/n';
+    
+                summary += '## 🛠️ Secrets\n\n';
+                summary += 'This GHES migration workflow does **not** automatically enumerate repository-level secrets from the source instance.\n\n';
+                summary += 'Please manually review and re-create any required secrets on the target GHEC repository (for example using gh secret set <NAME> --repo ';
+                summary += `${targetOrg}/${targetRepo}`;
+                summary += ' or the GitHub UI).\n\n';
+    
+    
+                if (secretError) {
+                    summary += '## ⚠️ Secrets\n\n';
+                    summary += `Could not list secrets: ${secretError}\n\n`;
+                } else if (secretCount && secretCount !== '0') {
+                    summary += '## 🔑 Secrets Requiring Manual Re-creation\n\n';
+                    summary += 'The following secret **names** were found in the source GHES repo. Values cannot be read via API — you must re-create them manually on GHEC.\n\n';
+                    summary += '| Secret Name | Scope |\n';
+                    summary += '|-------------|-------|\n';
+                    const parts = secretNames.split(' | ');
+                    for (const part of parts) {
+                    const [scope, ...names] = part.split(': ');
+                    if (names.length > 0) {
+                        const nameList = names.join(': ').split(', ');
+                        for (const name of nameList) {
+                        summary += `| \`${name.trim()}\` | ${scope} |\n`;
+                        }
+                    }
+                    }
+                    summary += `\n> **Total: ${secretCount} secret(s)**\n\n`;
+                    summary += `Use \`gh secret set <NAME> --repo ${targetOrg}/${targetRepo}\` or the GitHub UI to set them.\n\n`;
+                } else {
+                    summary += '## ✅ Secrets\n\nNo repository-level secrets to re-create.\n\n';
+                }
+    
+                summary += '## 📋 Next Steps\n\n';
+                summary += `1. 🔗 Visit your migrated repository: https://github.com/${targetOrg}/${targetRepo}\n`;
+                summary += `2. 🔍 Verify repository contents and settings\n`;
+                summary += `3. 🔒 Review and re-configure branch protection rules (GHES rules may not fully map to GHEC)\n`;
+                summary += `4. 🛡️ Enable GHAS features on GHEC (Advanced Security, Secret Scanning, Code Scanning)\n`;
+                summary += `5. 👥 Verify team access and collaborator permissions\n`;
+                summary += `6. 🔑 Re-create any secrets listed above\n`;
+                summary += `7. 🔄 Update CI/CD pipelines to point to GHEC\n`;
+                summary += `8. 🚀 Start developing!\n\n`;
+    
+                summary += '---\n\n';
+                summary += `*GHES → GHEC migration completed via GEI workflow run #${runId}, completing issue #${issueNumber}*\n`;
+    
+                await core.summary
+                .addRaw(summary)
+                .write();
+    
+        - name: Post success comment to issue
+            if: success()
+            uses: actions/github-script@v7
+            with:
+            script: |
+                const sourceOrg = '${{ needs.validate.outputs.source_organization }}';
+                const sourceRepo = '${{ needs.validate.outputs.source_repo }}';
+                const targetOrg = '${{ needs.validate.outputs.target_organization }}';
+                const targetRepo = '${{ needs.validate.outputs.target_repo }}';
+                const applicationTier = '${{ needs.validate.outputs.application_tier }}';
+                const issueNumber = '${{ needs.validate.outputs.issue_number }}';
+                const runId = context.runId;
+                const runUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+                const sourceBranches = '${{ needs.pre-migration.outputs.source_branches }}';
+                const sourceTags = '${{ needs.pre-migration.outputs.source_tags }}';
+                const sourceHeadSha = '${{ needs.pre-migration.outputs.source_head_sha }}';
+                const defaultBranch = '${{ needs.pre-migration.outputs.source_default_branch }}';
+    
+                const commentBody = `## ✅ GHES → GHEC Migration Completed Successfully!
+    
+                Your repository has been migrated from GHES to GHEC via GEI.
+    
+                ### 🎉 Migration Details
+                - **Source Repository:** \`${sourceOrg}/${sourceRepo}\`
+                - **Target Repository:** [${targetOrg}/${targetRepo}](https://github.com/${targetOrg}/${targetRepo})
+                - **Application Tier:** ${applicationTier}
+                - **Default Branch:** ${defaultBranch}
+                - **Workflow Run:** [#${runId}](${runUrl})
+    
+                ### 📊 Source Repository Stats
+                | Metric | Value |
+                |--------|-------|
+                | **Branches** | ${sourceBranches} |
+                | **Tags** | ${sourceTags} |
+                | **HEAD SHA** | \`${sourceHeadSha.substring(0, 12)}\` |
+    
+    
+                ### 📋 Next Steps
+                1. Visit your migrated repository: https://github.com/${targetOrg}/${targetRepo}
+                2. Verify repository contents and settings
+                3. Review actor-specific branch protection settings (push restrictions, dismissal restrictions, bypass allowances, lock branch, deployments)
+                4. Verify team access and collaborator permissions
+                5. Re-create any secrets listed above
+                6. Start developing! 🚀
+    
+                ---
+                *Automated by GitHub Actions workflow — GEI migration applied successfully*`;
+    
+                await github.rest.issues.createComment({
+                issue_number: parseInt(issueNumber),
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: commentBody
+                });
+        - name: Close issue
+            if: success()
+            uses: actions/github-script@v7
+            with:
+            script: |
+                const issueNumber = '${{ needs.validate.outputs.issue_number }}';
+                const sourceOrg = '${{ needs.validate.outputs.source_organization }}';
+                const sourceRepo = '${{ needs.validate.outputs.source_repo }}';
+                const targetOrg = '${{ needs.validate.outputs.target_organization }}';
+                const targetRepo = '${{ needs.validate.outputs.target_repo }}';
+                const sourceBranches = '${{ needs.pre-migration.outputs.source_branches }}';
+                const sourceTags = '${{ needs.pre-migration.outputs.source_tags }}';
+                const sourceHeadSha = '${{ needs.pre-migration.outputs.source_head_sha }}';
+                const targetUrl = `https://github.com/${targetOrg}/${targetRepo}`;
+    
+                const commentBody = `### 🎉 GHES → GHEC Migration Completed Successfully!
+    
+                | Detail | Value |
+                |--------|-------|
+                | **Source (GHES)** | \`${sourceOrg}/${sourceRepo}\` |
+                | **Target (GHEC)** | [\`${targetOrg}/${targetRepo}\`](${targetUrl}) |
+                | **Branches** | ${sourceBranches} |
+                | **Tags** | ${sourceTags} |
+                | **HEAD SHA** | \`${sourceHeadSha}\` |
+    
+                The repository has been successfully migrated from GHES to GHEC.`;
+    
+                // Post completion comment
+                await github.rest.issues.createComment({
+                issue_number: parseInt(issueNumber),
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: commentBody
+                });
+    
+                // Close issue
+                await github.rest.issues.update({
+                issue_number: parseInt(issueNumber),
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                state: 'closed',
+                state_reason: 'completed'
+                });
+    
+                // Add completion label and remove in-progress
+                try {
+                await github.rest.issues.removeLabel({
+                    issue_number: parseInt(issueNumber),
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    name: 'in-progress'
+                });
+                } catch (e) {
+                // Label may not exist, ignore
+                }
+    
+                await github.rest.issues.addLabels({
+                issue_number: parseInt(issueNumber),
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                labels: ['completed']
+                });
+    
+    
