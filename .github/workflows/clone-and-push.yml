@@ -26,8 +26,9 @@ jobs:
 
       - name: Push to destination repository
         run: |
+          DEST_REPO=$(echo "${{ github.event.inputs.destination_repo }}" | sed 's|https://github.com/||' | sed 's|/$||')
           cd temp-repo
-          git push --mirror https://${{ secrets.DEST_PAT_TOKEN }}@github.com/${{ github.event.inputs.destination_repo }}
+          git push --mirror "https://${{ secrets.DEST_PAT_TOKEN }}@github.com/${DEST_REPO}.git"
         env:
           GIT_TERMINAL_PROMPT: 0
 
