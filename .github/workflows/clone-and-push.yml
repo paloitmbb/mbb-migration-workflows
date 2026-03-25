@@ -17,19 +17,18 @@ jobs:
     runs-on: ubuntu-latest
     
     steps:
-      - name: Clone source repository
+      - name: Clone source repository (private)
         run: |
-          git clone --mirror ${{ github.event.inputs.source_repo }} temp-repo
+          SOURCE_URL=$(echo "${{ github.event.inputs.source_repo }}" | sed 's|https://|https://${{ secrets.SOURCE_PAT_TOKEN }}@|')
+          git clone --mirror "$SOURCE_URL" temp-repo
         env:
-          GIT_ASKPASS_OVERRIDE: true
           GIT_TERMINAL_PROMPT: 0
 
       - name: Push to destination repository
         run: |
           cd temp-repo
-          git push --mirror https://${{ secrets.PAT_TOKEN }}@github.com/${{ github.event.inputs.destination_repo }}
+          git push --mirror https://${{ secrets.DEST_PAT_TOKEN }}@github.com/${{ github.event.inputs.destination_repo }}
         env:
-          GIT_ASKPASS_OVERRIDE: true
           GIT_TERMINAL_PROMPT: 0
 
       - name: Cleanup
