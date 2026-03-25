@@ -1,0 +1,38 @@
+name: Clone and Push Repo Between Organizations
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: 'Source repository URL (e.g., https://github.com/source-org/repo.git)'
+        required: true
+        type: string
+      destination_repo:
+        description: 'Destination repository URL (e.g., https://github.com/dest-org/repo.git)'
+        required: true
+        type: string
+
+jobs:
+  clone-and-push:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Clone source repository
+        run: |
+          git clone --mirror ${{ github.event.inputs.source_repo }} temp-repo
+        env:
+          GIT_ASKPASS_OVERRIDE: true
+          GIT_TERMINAL_PROMPT: 0
+
+      - name: Push to destination repository
+        run: |
+          cd temp-repo
+          git push --mirror https://${{ secrets.PAT_TOKEN }}@github.com/${{ github.event.inputs.destination_repo }}
+        env:
+          GIT_ASKPASS_OVERRIDE: true
+          GIT_TERMINAL_PROMPT: 0
+
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -rf temp-repo
