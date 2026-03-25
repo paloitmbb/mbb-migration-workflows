@@ -27,10 +27,32 @@ jobs:
       - name: Push to destination repository
         run: |
           DEST_REPO=$(echo "${{ github.event.inputs.destination_repo }}" | sed 's|https://github.com/||' | sed 's|/$||')
+          DEST_URL="https://${{ secrets.DEST_PAT_TOKEN }}@github.com/${DEST_REPO}.git"
           cd temp-repo
-          git push --mirror "https://${{ secrets.DEST_PAT_TOKEN }}@github.com/${DEST_REPO}.git"
+          git push "$DEST_URL" 'refs/heads/*:refs/heads/*'
+          git push "$DEST_URL" 'refs/tags/*:refs/tags/*'
         env:
           GIT_TERMINAL_PROMPT: 0
+
+      - name: Sync default branch from source to destination
+        run: |
+          SOURCE_REPO=$(echo "${{ github.event.inputs.source_repo }}" | sed 's|https://github.com/||' | sed 's|\.git$||' | sed 's|/$||')
+          DEST_REPO=$(echo "${{ github.event.inputs.destination_repo }}" | sed 's|https://github.com/||' | sed 's|\.git$||' | sed 's|/$||')
+
+          # Get source default branch
+          DEFAULT_BRANCH=$(curl -s -H "Authorization: token ${{ secrets.SOURCE_PAT_TOKEN }}" \
+            "https://api.github.com/repos/${SOURCE_REPO}" | jq -r '.default_branch')
+
+          echo "Source default branch: $DEFAULT_BRANCH"
+
+          # Set same default branch on destination
+          curl -s -X PATCH \
+            -H "Authorization: token ${{ secrets.DEST_PAT_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"default_branch\": \"${DEFAULT_BRANCH}\"}" \
+            "https://api.github.com/repos/${DEST_REPO}"
+
+          echo "Default branch on destination set to: $DEFAULT_BRANCH"
 
       - name: Cleanup
         if: always()
